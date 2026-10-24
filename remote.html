@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Sign in to DeepSeek</title>
+<style>
+  body { margin:0; background:#0f1115; color:#e6e8ee; font:15px/1.5 system-ui,sans-serif; padding:12px; }
+  .row { display:flex; gap:6px; flex-wrap:wrap; margin:8px 0; }
+  button { background:#4d8dff; color:#fff; border:0; border-radius:8px; padding:9px 12px; font:inherit; }
+  button.g { background:#262b36; }
+  input { flex:1; min-width:140px; background:#171a21; color:#e6e8ee; border:1px solid #262b36;
+    border-radius:8px; padding:9px 10px; font:inherit; }
+  #view { width:100%; border:1px solid #262b36; border-radius:8px; display:block; background:#000; touch-action:manipulation; }
+  p { color:#8b93a5; margin:6px 0; font-size:13px; }
+  #st { color:#8b93a5; }
+</style>
+</head>
+<body>
+<h3 style="margin:4px 0">Sign in to DeepSeek</h3>
+<p>1) Press Start. 2) Tap the screen below to click. 3) Use the box to type. 4) When you see the chat box, press "I'm signed in".</p>
+<div class="row">
+  <button id="start">Start</button>
+  <button id="done" class="g">I'm signed in ✔</button>
+  <a href="/" style="color:#4d8dff;align-self:center">Back to chat</a>
+</div>
+<div class="row">
+  <input id="txt" placeholder="Type here (email / password / code)" autocomplete="off">
+  <button id="typ">Type</button>
+</div>
+<div class="row">
+  <button class="g" data-k="Enter">Enter</button>
+  <button class="g" data-k="Tab">Tab</button>
+  <button class="g" data-k="Backspace">⌫</button>
+  <button class="g" data-k="Escape">Esc</button>
+</div>
+<div id="st"></div>
+<img id="view" alt="Press Start">
+
+<script>
+const $ = s => document.querySelector(s);
+let KEY = localStorage.getItem('key') || '';
+if (!KEY) { KEY = (prompt('Enter your API key:') || '').trim(); localStorage.setItem('key', KEY); }
+const H = { 'Authorization': 'Bearer ' + KEY, 'Content-Type': 'application/json' };
+let running = false, fetching = false;
+
+async function post(path, body) {
+  const r = await fetch(path, { method: 'POST', headers: H, body: JSON.stringify(body || {}) });
+  if (!r.ok) { const j = await r.json().catch(() => ({})); $('#st').textContent = j.detail || ('Error ' + r.status); }
+  return r.ok;
+}
+async function shot() {
+  if (!running || fetching) return;
+  fetching = true;
+  try {
+    const r = await fetch('/remote/shot', { headers: H });
+    if (r.ok) { const b = await r.blob(); const old = $('#view').src; $('#view').src = URL.createObjectURL(b); if (old.startsWith('blob:')) URL.revokeObjectURL(old); }
+  } catch (e) {}
+  fetching = false;
+}
+setInterval(shot, 900);
+
+$('#start').onclick = async () => {
+  $('#st').textContent = 'Starting browser… (can take ~30s)';
+  if (await post('/remote/open')) { running = true; $('#st').textContent = ''; shot(); }
+};
+$('#view').onclick = async e => {
+  const img = e.target, r = img.getBoundingClientRect();
+  const x = (e.clientX - r.left) * img.naturalWidth / r.width;
+  const y = (e.clientY - r.top) * img.naturalHeight / r.height;
+  await post('/remote/click', { x, y }); setTimeout(shot, 300);
+};
+$('#typ').onclick = async () => {
+  const t = $('#txt').value; if (!t) return;
+  await post('/remote/type', { text: t }); $('#txt').value = ''; setTimeout(shot, 300);
+};
+document.querySelectorAll('[data-k]').forEach(b => b.onclick = async () => {
+  await post('/remote/key', { key: b.dataset.k }); setTimeout(shot, 300);
+});
+$('#done').onclick = async () => {
+  if (await post('/remote/finish')) { running = false; $('#st').textContent = 'Saved! Going to chat…'; setTimeout(() => location.href = '/', 800); }
+};
+</script>
+</body>
+</html>
