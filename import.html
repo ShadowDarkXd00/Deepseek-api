@@ -22,15 +22,19 @@
 (async () => {
   const $ = s => document.querySelector(s);
   const code = new URLSearchParams(location.search).get('c') || '';
-  const data = location.hash.slice(1);
+  const h = location.hash.slice(1);
+  let key = '', data = h;
+  const bar = h.indexOf('|');
+  if (bar > -1) { key = decodeURIComponent(h.slice(0, bar)); data = h.slice(bar + 1); }
   history.replaceState(null, '', '/import');   // remove the login data from the address bar
-  if (!code || !data) {
+  if ((!code && !key) || !data) {
     $('#ico').textContent = '⚠️'; $('#ttl').textContent = 'Nothing to import';
     $('#txt').innerHTML = 'Go to <a href="/connect" style="color:#4d8dff">Connect</a> and follow the steps again.'; return;
   }
   try {
     const r = await fetch('/session/import', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      method: 'POST',
+      headers: Object.assign({ 'Content-Type': 'application/json' }, key ? { 'Authorization': 'Bearer ' + key } : {}),
       body: JSON.stringify({ code, data })
     });
     const j = await r.json().catch(() => ({}));

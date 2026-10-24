@@ -274,15 +274,18 @@ async def connect_token(authorization: str | None = Header(default=None)):
 
 
 class ImportIn(BaseModel):
-    code: str
+    code: str = ""
     data: str
 
 
 @app.post("/session/import")
-async def session_import(body: ImportIn):
-    exp = State.codes.get(body.code, 0)
-    if not exp or exp < time.time():
-        raise HTTPException(403, "Code expired. Generate a new one on the Connect page.")
+async def session_import(body: ImportIn, authorization: str | None = Header(default=None)):
+    if authorization:            # reusable bookmark: authorised with your API key
+        check_key(authorization)
+    else:                        # one-time code
+        exp = State.codes.get(body.code, 0)
+        if not exp or exp < time.time():
+            raise HTTPException(403, "Code expired. Generate a new one on the Connect page.")
     try:
         raw = base64.b64decode(body.data + "=" * (-len(body.data) % 4))
         if len(raw) > 600_000:

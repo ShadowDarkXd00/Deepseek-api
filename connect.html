@@ -50,6 +50,23 @@
   You'll land on a page that says <b>Success</b>. Then go to your chat and talk.
 </div>
 
+<div class="card">
+  <b>Bookmark way (set up once, use any time)</b><br>
+  <p class="mut">No code needed. On Android, tapping a bookmark in the list does nothing. You must <b>type its name in the address bar</b> and tap it there.</p>
+  <button id="bm">Show bookmark text</button>
+  <div id="bmout" style="display:none">
+    <textarea id="bmtxt" readonly></textarea>
+    <p><button id="bmcopy">Copy</button></p>
+    <ol>
+      <li>Open this page, tap <b>⋮</b> → <b>☆</b> to bookmark it.</li>
+      <li>Tap <b>⋮</b> → <b>Bookmarks</b> → long-press that bookmark → <b>Edit</b>.</li>
+      <li>Change the name to <code>ds</code>.</li>
+      <li>Clear the URL, type <code>javascript:</code> by hand, then paste the copied text. Save.</li>
+      <li>Sign in at chat.deepseek.com. Tap the address bar, type <code>ds</code>, and tap the suggestion that has a bookmark icon.</li>
+    </ol>
+  </div>
+</div>
+
 <p><a href="/">Back to chat</a> &nbsp;·&nbsp; <a href="/remote">Backup sign-in (live browser)</a></p>
 
 <script>
@@ -70,6 +87,19 @@ $('#gen').onclick = async () => {
     "location.href='" + location.origin + "/import?c=" + j.code + "#'+btoa(unescape(encodeURIComponent(JSON.stringify(d))))})()";
   $('#snip').value = snippet;
   $('#out').style.display = 'block';
+};
+$('#bm').onclick = () => {
+  $('#bmtxt').value =
+    "(function(){if(location.host!=='chat.deepseek.com'){alert('Open chat.deepseek.com and sign in first');return}" +
+    "var d={ls:{},ck:document.cookie};" +
+    "for(var i=0;i<localStorage.length;i++){var k=localStorage.key(i),v=localStorage.getItem(k);if(v&&v.length<20000)d.ls[k]=v}" +
+    "location.href='" + location.origin + "/import#" + encodeURIComponent(KEY) + "|'+btoa(unescape(encodeURIComponent(JSON.stringify(d))))})()";
+  $('#bmout').style.display = 'block';
+};
+$('#bmcopy').onclick = async () => {
+  const t = $('#bmtxt'); t.select(); t.setSelectionRange(0, 99999);
+  try { await navigator.clipboard.writeText(t.value); } catch (e) { document.execCommand('copy'); }
+  $('#bmcopy').textContent = 'Copied ✔'; setTimeout(() => $('#bmcopy').textContent = 'Copy', 1500);
 };
 $('#copy').onclick = async () => {
   const t = $('#snip'); t.select(); t.setSelectionRange(0, 99999);
