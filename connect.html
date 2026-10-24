@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Connect your DeepSeek account</title>
+<style>
+  body { margin:0; background:#0f1115; color:#e6e8ee; font:15px/1.55 system-ui,sans-serif; padding:14px; max-width:640px; margin:auto; }
+  button { background:#4d8dff; color:#fff; border:0; border-radius:8px; padding:10px 14px; font:inherit; }
+  button.g { background:#262b36; }
+  a { color:#4d8dff; }
+  ol { padding-left:20px; }
+  li { margin:10px 0; }
+  textarea { width:100%; height:92px; background:#171a21; color:#cfd6e6; border:1px solid #262b36;
+    border-radius:8px; padding:8px; font:12px ui-monospace,Menlo,monospace; }
+  .card { background:#171a21; border:1px solid #262b36; border-radius:12px; padding:12px 14px; margin:12px 0; }
+  .mut { color:#8b93a5; font-size:13px; }
+  code { background:#262b36; padding:1px 6px; border-radius:5px; }
+  #msg { color:#ffb86b; min-height:20px; }
+</style>
+</head>
+<body>
+<h2 style="margin:6px 0">Connect your DeepSeek account</h2>
+<p class="mut">Sign in with your own Chrome, where your phone's Google accounts are already listed. Then send that login to your site in one step.</p>
+
+<div class="card">
+  <b>Step 1.</b> Make your one-time code.<br><br>
+  <button id="gen">Make code</button>
+  <div id="msg"></div>
+  <div id="out" style="display:none">
+    <p class="mut">Code is valid for 10 minutes. Tap <b>Copy</b> now.</p>
+    <textarea id="snip" readonly></textarea>
+    <p><button id="copy">Copy</button></p>
+  </div>
+</div>
+
+<div class="card">
+  <b>Step 2.</b> In <b>Chrome</b>, open a new tab and go to
+  <a href="https://chat.deepseek.com" target="_blank" rel="noopener">chat.deepseek.com</a>.
+  Choose <b>Sign in with Google</b> and pick your account.
+</div>
+
+<div class="card">
+  <b>Step 3.</b> When you can see the DeepSeek chat box:
+  <ol>
+    <li>Tap the address bar at the top of Chrome.</li>
+    <li>Type <code>javascript:</code> (Chrome removes it if you paste it, so type it).</li>
+    <li>Paste the copied text right after it, then press <b>Go</b>.</li>
+  </ol>
+  You'll land on a page that says <b>Success</b>. Then go to your chat and talk.
+</div>
+
+<p><a href="/">Back to chat</a> &nbsp;·&nbsp; <a href="/remote">Backup sign-in (live browser)</a></p>
+
+<script>
+const $ = s => document.querySelector(s);
+let KEY = localStorage.getItem('key') || '';
+if (!KEY) { KEY = (prompt('Enter your API key:') || '').trim(); localStorage.setItem('key', KEY); }
+
+$('#gen').onclick = async () => {
+  $('#msg').textContent = 'Making code…';
+  const r = await fetch('/connect/token', { method: 'POST', headers: { 'Authorization': 'Bearer ' + KEY } });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) { $('#msg').textContent = j.detail || ('Error ' + r.status); return; }
+  $('#msg').textContent = '';
+  const snippet =
+    "(function(){if(location.host!=='chat.deepseek.com'){alert('Open chat.deepseek.com and sign in first');return}" +
+    "var d={ls:{},ck:document.cookie};" +
+    "for(var i=0;i<localStorage.length;i++){var k=localStorage.key(i),v=localStorage.getItem(k);if(v&&v.length<20000)d.ls[k]=v}" +
+    "location.href='" + location.origin + "/import?c=" + j.code + "#'+btoa(unescape(encodeURIComponent(JSON.stringify(d))))})()";
+  $('#snip').value = snippet;
+  $('#out').style.display = 'block';
+};
+$('#copy').onclick = async () => {
+  const t = $('#snip'); t.select(); t.setSelectionRange(0, 99999);
+  try { await navigator.clipboard.writeText(t.value); } catch (e) { document.execCommand('copy'); }
+  $('#copy').textContent = 'Copied ✔'; setTimeout(() => $('#copy').textContent = 'Copy', 1500);
+};
+</script>
+</body>
+</html>

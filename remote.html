@@ -3,82 +3,144 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Sign in to DeepSeek</title>
+<title>Backup sign-in</title>
 <style>
-  body { margin:0; background:#0f1115; color:#e6e8ee; font:15px/1.5 system-ui,sans-serif; padding:12px; }
+  body { margin:0; background:#0f1115; color:#e6e8ee; font:15px/1.5 system-ui,sans-serif; padding:10px; }
   .row { display:flex; gap:6px; flex-wrap:wrap; margin:8px 0; }
   button { background:#4d8dff; color:#fff; border:0; border-radius:8px; padding:9px 12px; font:inherit; }
   button.g { background:#262b36; }
   input { flex:1; min-width:140px; background:#171a21; color:#e6e8ee; border:1px solid #262b36;
     border-radius:8px; padding:9px 10px; font:inherit; }
-  #view { width:100%; border:1px solid #262b36; border-radius:8px; display:block; background:#000; touch-action:manipulation; }
+  .box { position:relative; width:100%; max-width:460px; margin:6px auto; }
+  #view { width:100%; display:block; border:1px solid #262b36; border-radius:8px; background:#000;
+    touch-action:none; user-select:none; -webkit-user-select:none; -webkit-user-drag:none;
+    -webkit-touch-callout:none; }
+  #dot { position:absolute; width:22px; height:22px; margin:-11px 0 0 -11px; border-radius:50%;
+    background:rgba(255,80,80,.55); border:2px solid #fff; pointer-events:none; opacity:0; transition:opacity .5s; }
   p { color:#8b93a5; margin:6px 0; font-size:13px; }
-  #st { color:#8b93a5; }
+  a { color:#4d8dff; }
+  #st { color:#ffb86b; min-height:20px; }
 </style>
 </head>
 <body>
-<h3 style="margin:4px 0">Sign in to DeepSeek</h3>
-<p>1) Press Start. 2) Tap the screen below to click. 3) Use the box to type. 4) When you see the chat box, press "I'm signed in".</p>
+<h3 style="margin:4px 0">Backup sign-in (live browser)</h3>
+<p>Easier option: <a href="/connect">sign in with your own Chrome</a>. Use this page only if that fails.</p>
+<p><b>Tap</b> = click. <b>Drag</b> = slide captcha (drag slowly, then release). <b>Press and hold</b> = hold captcha.</p>
 <div class="row">
   <button id="start">Start</button>
   <button id="done" class="g">I'm signed in ✔</button>
-  <a href="/" style="color:#4d8dff;align-self:center">Back to chat</a>
+  <a href="/" style="align-self:center">Back to chat</a>
 </div>
-<div class="row">
-  <input id="txt" placeholder="Type here (email / password / code)" autocomplete="off">
-  <button id="typ">Type</button>
-</div>
-<div class="row">
+<div id="st"></div>
+<div class="box" id="box"><img id="view" alt="Press Start" draggable="false"><div id="dot"></div></div>
+<div class="row" style="justify-content:center">
+  <button class="g" id="up">▲ Scroll</button>
+  <button class="g" id="dn">▼ Scroll</button>
   <button class="g" data-k="Enter">Enter</button>
   <button class="g" data-k="Tab">Tab</button>
   <button class="g" data-k="Backspace">⌫</button>
   <button class="g" data-k="Escape">Esc</button>
 </div>
-<div id="st"></div>
-<img id="view" alt="Press Start">
+<div class="row">
+  <input id="txt" placeholder="Type here (email / password / code)" autocomplete="off">
+  <button id="typ">Type</button>
+</div>
 
 <script>
 const $ = s => document.querySelector(s);
 let KEY = localStorage.getItem('key') || '';
 if (!KEY) { KEY = (prompt('Enter your API key:') || '').trim(); localStorage.setItem('key', KEY); }
 const H = { 'Authorization': 'Bearer ' + KEY, 'Content-Type': 'application/json' };
-let running = false, fetching = false;
+let running = false, fetching = false, down = null;
+const view = $('#view');
 
 async function post(path, body) {
   const r = await fetch(path, { method: 'POST', headers: H, body: JSON.stringify(body || {}) });
   if (!r.ok) { const j = await r.json().catch(() => ({})); $('#st').textContent = j.detail || ('Error ' + r.status); }
+  else $('#st').textContent = '';
   return r.ok;
 }
 async function shot() {
-  if (!running || fetching) return;
+  if (!running || fetching || down) return;
   fetching = true;
   try {
     const r = await fetch('/remote/shot', { headers: H });
-    if (r.ok) { const b = await r.blob(); const old = $('#view').src; $('#view').src = URL.createObjectURL(b); if (old.startsWith('blob:')) URL.revokeObjectURL(old); }
+    if (r.ok) {
+      const b = await r.blob(); const old = view.src;
+      view.src = URL.createObjectURL(b);
+      if (old.startsWith('blob:')) URL.revokeObjectURL(old);
+    }
   } catch (e) {}
   fetching = false;
 }
-setInterval(shot, 900);
+const refreshSoon = () => { setTimeout(shot, 150); setTimeout(shot, 700); };
+setInterval(shot, 600);
+
+function map(e) {
+  const r = view.getBoundingClientRect();
+  return {
+    x: (e.clientX - r.left) * view.naturalWidth / r.width,
+    y: (e.clientY - r.top) * view.naturalHeight / r.height,
+    px: e.clientX - r.left, py: e.clientY - r.top
+  };
+}
+function dot(px, py) {
+  const d = $('#dot'); d.style.left = px + 'px'; d.style.top = py + 'px'; d.style.opacity = 1;
+  setTimeout(() => d.style.opacity = 0, 500);
+}
+function thin(pts) {
+  const step = Math.max(1, Math.ceil(pts.length / 60)); const out = [];
+  for (let i = 0; i < pts.length; i += step) out.push(pts[i]);
+  if (out[out.length - 1] !== pts[pts.length - 1]) out.push(pts[pts.length - 1]);
+  return out;
+}
+
+view.addEventListener('pointerdown', e => {
+  if (!running) return;
+  e.preventDefault(); view.setPointerCapture(e.pointerId);
+  const m = map(e);
+  down = { t0: performance.now(), start: m, pts: [{ x: m.x, y: m.y, t: 0 }], moved: false };
+});
+view.addEventListener('pointermove', e => {
+  if (!down) return;
+  const m = map(e);
+  if (Math.hypot(m.px - down.start.px, m.py - down.start.py) > 8) down.moved = true;
+  down.pts.push({ x: m.x, y: m.y, t: performance.now() - down.t0 });
+});
+view.addEventListener('pointerup', async e => {
+  if (!down) return;
+  const d = down; down = null;
+  const m = map(e), el = performance.now() - d.t0;
+  dot(m.px, m.py);
+  if (!d.moved) {
+    await post('/remote/click', { x: d.start.x, y: d.start.y, hold_ms: el > 350 ? Math.min(el, 3000) : 0 });
+  } else {
+    d.pts.push({ x: m.x, y: m.y, t: el });
+    await post('/remote/drag', { points: thin(d.pts) });
+  }
+  refreshSoon();
+});
+view.addEventListener('pointercancel', () => { down = null; });
+view.addEventListener('contextmenu', e => e.preventDefault());
 
 $('#start').onclick = async () => {
   $('#st').textContent = 'Starting browser… (can take ~30s)';
   if (await post('/remote/open')) { running = true; $('#st').textContent = ''; shot(); }
 };
-$('#view').onclick = async e => {
-  const img = e.target, r = img.getBoundingClientRect();
-  const x = (e.clientX - r.left) * img.naturalWidth / r.width;
-  const y = (e.clientY - r.top) * img.naturalHeight / r.height;
-  await post('/remote/click', { x, y }); setTimeout(shot, 300);
-};
 $('#typ').onclick = async () => {
   const t = $('#txt').value; if (!t) return;
-  await post('/remote/type', { text: t }); $('#txt').value = ''; setTimeout(shot, 300);
+  await post('/remote/type', { text: t }); $('#txt').value = ''; refreshSoon();
 };
+$('#up').onclick = async () => { await post('/remote/scroll', { dy: -400 }); refreshSoon(); };
+$('#dn').onclick = async () => { await post('/remote/scroll', { dy: 400 }); refreshSoon(); };
 document.querySelectorAll('[data-k]').forEach(b => b.onclick = async () => {
-  await post('/remote/key', { key: b.dataset.k }); setTimeout(shot, 300);
+  await post('/remote/key', { key: b.dataset.k }); refreshSoon();
 });
 $('#done').onclick = async () => {
-  if (await post('/remote/finish')) { running = false; $('#st').textContent = 'Saved! Going to chat…'; setTimeout(() => location.href = '/', 800); }
+  $('#st').textContent = 'Saving…';
+  if (await post('/remote/finish')) {
+    running = false; $('#st').textContent = 'Saved! Going to chat…'; setTimeout(() => location.href = '/', 900);
+  }
 };
 </script>
 </body>

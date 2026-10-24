@@ -41,6 +41,10 @@
   .err { color:#ff7b7b; }
   .err a { color:var(--acc); }
   .empty { text-align:center; color:var(--mut); margin-top:20vh; }
+  #stbar { padding:7px 12px; font-size:13px; border-bottom:1px solid var(--line); color:var(--mut); }
+  #stbar.ok { color:#5ad28a; }
+  #stbar.bad { color:#ff9a6b; }
+  #stbar a { color:var(--acc); margin-left:6px; }
   #in { border-top:1px solid var(--line); padding:10px; }
   #in .wrap { display:flex; gap:8px; align-items:flex-end; }
   textarea { flex:1; background:var(--panel); color:var(--txt); border:1px solid var(--line);
@@ -58,11 +62,13 @@
     <div class="top"><button id="new" style="flex:1">+ New chat</button></div>
     <div id="list"></div>
     <div class="foot">
-      <a href="/remote">Sign in to DeepSeek</a><br>
+      <a href="/connect">Connect DeepSeek account</a><br>
+      <a href="/remote">Backup sign-in</a><br>
       <button class="ghost" id="chkey" style="padding:6px 0">Change API key</button>
     </div>
   </aside>
   <div id="main">
+    <div id="stbar">Checking account…</div>
     <div id="bar"><button class="ghost" id="menu">☰</button><b id="ttl">My Code Chat</b></div>
     <div id="msgs"><div class="wrap" id="wrap"></div></div>
     <div id="in"><div class="wrap">
@@ -169,6 +175,7 @@ async function send() {
       if (r.status === 401) { KEY = ''; localStorage.removeItem('key'); }
       pending.error = j.detail || ('Error ' + r.status);
       pending.login = r.status === 409;
+      if (r.status === 409) connected = false;
       delete pending.html;
     } else {
       c.url = j.chat_url; pending.html = j.html; pending.text = j.reply;
@@ -177,7 +184,31 @@ async function send() {
     pending.error = 'Network error: ' + e.message; delete pending.html;
   }
   delete pending.pending;
-  busy = false; $('#send').disabled = false; save(); render();
+  busy = false; save(); render(); setStatus();
+}
+
+let connected = null, account = null;   // null = not checked yet
+function setStatus() {
+  const el = $('#stbar');
+  if (connected === true) {
+    el.className = 'ok'; el.textContent = '● Connected' + (account ? ' as ' + account : '');
+  } else if (connected === false) {
+    el.className = 'bad';
+    el.innerHTML = '● Not connected — <a href="/connect">Connect your account</a>';
+  } else { el.className = ''; el.textContent = 'Checking account…'; }
+  $('#send').disabled = busy || connected === false;
+  $('#msg').placeholder = connected === false
+    ? 'Connect your account first to start chatting'
+    : 'Ask for code… (Ctrl+Enter to send)';
+}
+async function checkStatus() {
+  if (!KEY || busy) return;
+  try {
+    const r = await fetch('/status', { headers: { 'Authorization': 'Bearer ' + KEY } });
+    if (r.status === 401) { KEY = ''; localStorage.removeItem('key'); return; }
+    const j = await r.json();
+    connected = j.connected; account = j.account || null; setStatus();
+  } catch (e) {}
 }
 
 $('#send').onclick = send;
@@ -185,10 +216,13 @@ $('#msg').addEventListener('keydown', e => { if (e.key === 'Enter' && (e.ctrlKey
 $('#msg').addEventListener('input', e => { e.target.style.height = 'auto'; e.target.style.height = Math.min(e.target.scrollHeight, 180) + 'px'; });
 $('#new').onclick = () => { cur = null; render(); $('#side').classList.remove('open'); $('#msg').focus(); };
 $('#menu').onclick = () => $('#side').classList.toggle('open');
-$('#chkey').onclick = () => { askKey(); };
+$('#chkey').onclick = () => { askKey(); checkStatus(); };
 
 if (!KEY) askKey();
 render();
+setStatus();
+checkStatus();
+setInterval(checkStatus, 15000);
 </script>
 </body>
 </html>
