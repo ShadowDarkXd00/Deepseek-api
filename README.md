@@ -1,26 +1,30 @@
-# My DeepSeek Code Chat (unofficial)
+# ShadowV1 by Vortex (unofficial DeepSeek web-chat API)
 
-Your own website + API key on top of the DeepSeek web chat.
-
-## Files to upload to a PRIVATE GitHub repo
-server.py, index.html, remote.html, Dockerfile, requirements.txt, .gitignore
+Your own website, OpenAI-compatible API and Telegram bot on top of the DeepSeek web chat.
 
 ## Deploy on Render
-- New > Web Service > connect the repo > Runtime: Docker
-- Environment variable: MY_API_KEY = a long random password (this is your API key)
-- Recommended: Starter plan + a Disk mounted at /data (keeps your login after restarts)
+- New > Web Service > connect this repo > Runtime: Docker
+- Env var `MY_API_KEY` = a long random password (comma-separate several keys to give each bot its own)
+- Recommended: Starter plan + a Disk mounted at `/data` (keeps the DeepSeek login after restarts)
 
-## First use
-1. Open https://YOUR-APP.onrender.com/remote
-2. Enter your API key, press Start, tap through the Google sign-in, press "I'm signed in"
-3. Go to the main page and chat
+## Connect your DeepSeek account
+Open `/connect` (sign in with your own Chrome) or `/remote` (live browser view).
 
-## API
-POST /chat  {"message": "write a python hello world", "chat_url": null}
-Header: Authorization: Bearer YOUR_KEY
-Send the returned chat_url back to continue the same conversation.
+## Use it
+- Website: `/` (new chats, old chats, code blocks with Copy, Think and Search switches)
+- API guide with your URL and key filled in: `/guide`
+- OpenAI-compatible: `POST /v1/chat/completions`, `GET /v1/models`
+  - models: `shadowv1`, `shadowv1-think`, `shadowv1-search`, `shadowv1-think-search`
+  - or send `"think": true` / `"search": true`
+  - `"stream": true` is supported
+- Simple: `POST /chat` `{"message": "...", "chat_url": null, "think": false, "search": false}`
 
-OpenAI-style: POST /v1/chat/completions
+## Telegram bot
+Env vars: `TELEGRAM_BOT_TOKEN` (from @BotFather) and `TELEGRAM_ALLOWED_IDS` (comma-separated Telegram IDs).
+Message the bot once to see your ID. Commands: `/new`, `/think on|off`, `/search on|off`, `/status`.
+
+## Optional env vars
+`BOT_NAME` (default ShadowV1), `BOT_MAKER` (default Vortex), `SYSTEM_PROMPT` (replace the built-in coding prompt).
 
 ## If it breaks
-DeepSeek changes its page layout. Update SEL_INPUT / SEL_REPLY in server.py.
+DeepSeek changes its page layout. Update `SEL_INPUT` / `SEL_REPLY` in `server.py`, and the labels in `shadow.py`.

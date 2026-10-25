@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>My Code Chat</title>
+<title>ShadowV1 by Vortex</title>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/dompurify/3.1.6/purify.min.js"></script>
 <style>
   :root { --bg:#0f1115; --panel:#171a21; --line:#262b36; --txt:#e6e8ee; --mut:#8b93a5; --acc:#4d8dff; }
@@ -45,6 +45,11 @@
   #stbar.ok { color:#5ad28a; }
   #stbar.bad { color:#ff9a6b; }
   #stbar a { color:var(--acc); margin-left:6px; }
+  #tgl { display:flex; gap:8px; margin-bottom:8px; }
+  .tg { background:var(--line); color:var(--mut); border-radius:20px; padding:6px 13px; font-size:13px; }
+  .tg.on { background:var(--acc); color:#fff; }
+  details.th { margin:0 0 10px; color:var(--mut); font-size:13px; border-left:2px solid var(--line); padding-left:10px; }
+  details.th summary { cursor:pointer; }
   #in { border-top:1px solid var(--line); padding:10px; }
   #in .wrap { display:flex; gap:8px; align-items:flex-end; }
   textarea { flex:1; background:var(--panel); color:var(--txt); border:1px solid var(--line);
@@ -64,14 +69,15 @@
     <div class="foot">
       <a href="/connect">Connect DeepSeek account</a><br>
       <a href="/remote">Backup sign-in</a><br>
+      <a href="/guide">API guide (Telegram / bots)</a><br>
       <button class="ghost" id="chkey" style="padding:6px 0">Change API key</button>
     </div>
   </aside>
   <div id="main">
     <div id="stbar">Checking account…</div>
-    <div id="bar"><button class="ghost" id="menu">☰</button><b id="ttl">My Code Chat</b></div>
+    <div id="bar"><button class="ghost" id="menu">☰</button><b id="ttl">ShadowV1</b></div>
     <div id="msgs"><div class="wrap" id="wrap"></div></div>
-    <div id="in"><div class="wrap">
+    <div id="in"><div class="wrap" id="tgl"><button class="tg" id="tThink">🧠 Think</button><button class="tg" id="tSearch">🔍 Search</button></div><div class="wrap">
       <textarea id="msg" rows="1" placeholder="Ask for code… (Ctrl+Enter to send)"></textarea>
       <button id="send">Send</button>
     </div></div>
@@ -86,6 +92,15 @@ try { chats = JSON.parse(localStorage.getItem('chats') || '[]'); } catch (e) {}
 chats.forEach(c => c.msgs = (c.msgs || []).filter(m => !m.pending));
 let cur = chats.length ? chats[0].id : null;
 let busy = false;
+let flags = { think: false, search: false };
+try { flags = Object.assign(flags, JSON.parse(localStorage.getItem('flags') || '{}')); } catch (e) {}
+function paintFlags() {
+  $('#tThink').classList.toggle('on', !!flags.think);
+  $('#tSearch').classList.toggle('on', !!flags.search);
+  try { localStorage.setItem('flags', JSON.stringify(flags)); } catch (e) {}
+}
+$('#tThink').onclick = () => { flags.think = !flags.think; paintFlags(); };
+$('#tSearch').onclick = () => { flags.search = !flags.search; paintFlags(); };
 
 function save() { localStorage.setItem('chats', JSON.stringify(chats)); }
 function askKey() {
@@ -132,9 +147,9 @@ function renderSide() {
 function renderMsgs() {
   const w = $('#wrap'); w.innerHTML = '';
   const c = getChat();
-  $('#ttl').textContent = c ? c.title : 'My Code Chat';
+  $('#ttl').textContent = c ? c.title : 'ShadowV1';
   if (!c || !c.msgs.length) {
-    w.innerHTML = '<div class="empty">Ask me to write some code 👇</div>'; return;
+    w.innerHTML = '<div class="empty"><b style="font-size:22px;color:var(--txt)">ShadowV1</b><br>by Vortex<br><br>Tell me what to build 👇</div>'; return;
   }
   c.msgs.forEach(m => {
     const d = document.createElement('div');
@@ -142,7 +157,15 @@ function renderMsgs() {
     else if (m.error) {
       d.className = 'm err'; d.textContent = m.error;
       if (m.login) { d.append(' '); const a = document.createElement('a'); a.href = '/remote'; a.textContent = 'Open sign-in page'; d.append(a); }
-    } else { d.className = 'm a'; d.append(cleanHtml(m.html || '')); }
+    } else {
+      d.className = 'm a';
+      if (m.thinking) {
+        const dt = document.createElement('details'); dt.className = 'th';
+        dt.innerHTML = '<summary>🧠 Thought process</summary>';
+        dt.append(cleanHtml(m.thinking)); d.append(dt);
+      }
+      d.append(cleanHtml(m.html || ''));
+    }
     w.append(d);
   });
   const box = $('#msgs'); box.scrollTop = box.scrollHeight;
@@ -168,17 +191,17 @@ async function send() {
     const r = await fetch('/chat', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + KEY },
-      body: JSON.stringify({ message: text, chat_url: c.url })
+      body: JSON.stringify({ message: text, chat_url: c.url, think: flags.think, search: flags.search })
     });
     const j = await r.json().catch(() => ({}));
-    if (!r.ok) {
+    if (!r.ok || j.error) {
       if (r.status === 401) { KEY = ''; localStorage.removeItem('key'); }
       pending.error = j.detail || ('Error ' + r.status);
-      pending.login = r.status === 409;
-      if (r.status === 409) connected = false;
+      pending.login = r.status === 409 || j.status === 409;
+      if (pending.login) connected = false;
       delete pending.html;
     } else {
-      c.url = j.chat_url; pending.html = j.html; pending.text = j.reply;
+      c.url = j.chat_url; pending.html = j.html; pending.text = j.reply; pending.thinking = j.thinking_html || '';
     }
   } catch (e) {
     pending.error = 'Network error: ' + e.message; delete pending.html;
@@ -223,6 +246,7 @@ render();
 setStatus();
 checkStatus();
 setInterval(checkStatus, 15000);
+paintFlags();
 </script>
 </body>
 </html>
