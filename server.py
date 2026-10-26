@@ -276,16 +276,37 @@ async def lifespan(app: FastAPI):
 app = FastAPI(lifespan=lifespan)
 
 
+def _clean_token(t: str) -> str:
+    t = (t or "").strip().strip("\"'`").strip()
+    while t.lower().startswith("bearer "):
+        t = t[7:].strip().strip("\"'`").strip()
+    return t
+
+
 def _token_of(authorization=None, key=None, x_api_key=None):
-    if authorization and authorization.lower().startswith("bearer "):
-        return authorization[7:].strip()
-    return (key or x_api_key or "").strip()
+    # accept "Bearer KEY", a bare "KEY", ?key=KEY and the x-api-key header
+    return _clean_token(authorization) or _clean_token(key) or _clean_token(x_api_key)
 
 
 def check_key(authorization=None, key=None, x_api_key=None):
     token = _token_of(authorization, key, x_api_key)
-    if not token or not any(secrets.compare_digest(token, k) for k in API_KEYS):
-        raise HTTPException(401, "Invalid API key")
+    ok = bool(token) and any(secrets.compare_digest(token.encode(), k.encode()) for k in API_KEYS)
+    if not ok:
+        shown = (token[:5] + "..." + token[-3:] + f" (len {len(token)})") if len(token) > 10 else repr(token)
+        log("[auth] rejected key:", shown, "| expected len:", sorted({len(k) for k in API_KEYS}))
+        raise HTTPException(401, "Invalid API key. Use the exact key from your Render MY_API_KEY setting.")
+
+
+@app.middleware("http")
+async def _auth_headers(request, call_next):
+    """Cline/Continue/Azure-style clients put the key in different headers: fold them into Authorization."""
+    hdrs = request.headers
+    if not hdrs.get("authorization", "").strip():
+        alt = hdrs.get("x-api-key") or hdrs.get("api-key") or hdrs.get("openai-api-key") or ""
+        if alt.strip():
+            request.scope["headers"] = [(k, v) for k, v in request.scope["headers"] if k != b"authorization"] + \
+                                       [(b"authorization", ("Bearer " + alt.strip()).encode())]
+    return await call_next(request)
 
 
 async def guard(coro):
