@@ -1,4 +1,5 @@
 fastapi
 uvicorn
 httpx
+redis
 playwright==1.49.0

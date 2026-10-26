@@ -63,6 +63,25 @@
 <h3>5. Other endpoints</h3>
 <pre><code id="c5"></code></pre>
 
+<h3>Prompt URL (just open it in a browser)</h3>
+<pre><code id="c6"></code></pre>
+<p class="mut">Add <code>&think=1</code> or <code>&search=1</code>. Say "draw a ..." to get an image, or "send 5 anime pics from pinterest" for pictures. Your key is required so strangers can't use your account.</p>
+
+<h3>VS Code (Cline, Roo Code, Continue)</h3>
+<div class="card"><ol>
+  <li>Open the extension settings and pick provider <b>OpenAI Compatible</b>.</li>
+  <li><b>Base URL</b>: <code class="b1"></code> &nbsp; <b>API key</b>: your key &nbsp; <b>Model ID</b>: <code>shadowv1</code></li>
+  <li>Agents send very long prompts, so replies can take a while. Prefer <code>shadowv1</code> over the think model.</li>
+</ol></div>
+
+<h3>Build and ship (needs tokens)</h3>
+<p class="mut">Add <code>GITHUB_TOKEN</code> and <code>RENDER_API_KEY</code> in Render's Environment tab. Then:<br>
+<code>POST /build</code> {"idea": "a todo app"}: builds it, pushes to a new GitHub repo, and hosts it on Render.<br>
+<code>POST /github/push</code>, <code>/github/run</code> (workflows), <code>/render/deploy</code>, <code>/render/logs</code>.</p>
+
+<h3>Images</h3>
+<pre><code id="c7"></code></pre>
+
 <h3>Good to know</h3>
 <ul>
   <li>Requests are answered <b>one at a time</b>, so many users at once will queue.</li>
@@ -103,6 +122,15 @@ POST ${BASE}/chat             {"message": "...", "chat_url": null, "think": fals
                               send back "chat_url" to continue the same chat
 GET  ${BASE}/status           is DeepSeek connected?
 GET  ${BASE}/health           uptime check`;
+$('#c6').textContent =
+`${BASE}/write a python snake game?key=${K}
+${BASE}/who are you?key=${K}&think=1`;
+$('#c7').textContent =
+`curl -X POST ${BASE}/v1/images/generations -H "Authorization: Bearer ${K}" \\
+  -H "Content-Type: application/json" -d '{"prompt":"samurai cat, anime style"}'
+
+${BASE}/img/samurai cat on a rooftop?key=${K}   (opens the image directly)
+${BASE}/pins/anime aesthetic?n=5&key=${K}      (picture links)`;
 document.querySelectorAll('pre').forEach(pre => {
   const b = document.createElement('button'); b.className = 'cp'; b.textContent = 'Copy';
   b.onclick = async () => {
