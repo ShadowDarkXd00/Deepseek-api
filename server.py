@@ -430,7 +430,10 @@ async def _send_and_wait(page, prompt: str, think: bool, search: bool, on_delta=
         box = page.locator(SEL_INPUT).first
         await box.click()
         await box.fill(prompt)
+        if len(prompt) > 1200:                     # long messages: let the page enable its send button first
+            await asyncio.sleep(0.35)
         await page.keyboard.press("Enter")
+        resend_at = time.time() + 2.5
 
         t0 = time.time()
         first_deadline = t0 + (360 if think else 180 if search else 90)
@@ -443,8 +446,22 @@ async def _send_and_wait(page, prompt: str, think: bool, search: bool, on_delta=
                 last_think = g["think_html"]
                 await on_delta("think", html_to_md(last_think, partial=True))
             if not (g["nAns"] > before and g["ans_text"].strip()):
+                if now > resend_at:                    # still no answer: was the message really sent?
+                    resend_at = now + 4
+                    try:
+                        left = await page.evaluate("() => { const t = document.querySelector('textarea'); return t ? t.value.length : 0 }")
+                        if left > 5:
+                            log("[send] message still in the box, pressing Enter again")
+                            await page.keyboard.press("Enter")
+                    except Exception:
+                        pass
                 if now > first_deadline:
-                    raise HTTPException(504, "No reply from DeepSeek (selectors changed, or it is busy).")
+                    try:
+                        seen = await page.evaluate("() => document.body.innerText.slice(-300)")
+                    except Exception:
+                        seen = "?"
+                    log("[send] no reply. Page shows:", " ".join(str(seen).split())[:300])
+                    raise HTTPException(504, "No reply from DeepSeek (it may be busy or showing an error). Try again.")
                 await asyncio.sleep(poll)
                 continue
             cur = g["ans_text"]

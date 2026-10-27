@@ -19,7 +19,7 @@ from pathlib import Path
 
 WORK = Path(os.getenv("AGENT_WORKDIR", "/tmp/shadow-work"))
 WORK.mkdir(parents=True, exist_ok=True)
-MAX_OBS = 6000
+MAX_OBS = 3500
 
 PROTOCOL = """You are an autonomous coding and DevOps agent. You work by calling tools, one per reply.
 
@@ -211,7 +211,7 @@ def describe(name: str, args: dict) -> str:
 
 
 def _j(x) -> str:
-    s = x if isinstance(x, str) else json.dumps(x, ensure_ascii=False, indent=1)
+    s = x if isinstance(x, str) else json.dumps(x, ensure_ascii=False, separators=(",", ":"))
     return s if len(s) <= MAX_OBS else s[:MAX_OBS] + "\n...[cut]"
 
 
