@@ -60,6 +60,12 @@ LAUNCH_ARGS = [
     "--disable-blink-features=AutomationControlled",
     "--no-sandbox",
     "--disable-dev-shm-usage",
+    "--disable-gpu",
+    "--disable-extensions",
+    "--disable-background-networking",
+    "--mute-audio",
+    "--renderer-process-limit=1",
+    "--js-flags=--max-old-space-size=256",
 ]
 ALLOWED_KEYS = {"Enter", "Tab", "Backspace", "Escape", "ArrowDown", "ArrowUp",
                 "ArrowLeft", "ArrowRight", "Delete", "Space"}
@@ -243,13 +249,28 @@ async def background_loop():
             await save_state()
 
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    if not API_KEYS:
-        raise RuntimeError("Set the MY_API_KEY environment variable first.")
-    State.http = httpx.AsyncClient(follow_redirects=True, timeout=30)
-    await KV.start()
-    State.pw = await async_playwright().start()
+def _healthy() -> bool:
+    try:
+        return bool(State.browser and State.browser.is_connected() and State.page and not State.page.is_closed())
+    except Exception:
+        return False
+
+
+def _is_dead(e: Exception) -> bool:
+    m = str(e).lower()
+    return any(k in m for k in ("has been closed", "target closed", "browser has been", "crashed",
+                                "disconnected", "connection closed", "page closed"))
+
+
+async def _launch():
+    """(Re)start Chromium + the DeepSeek page. Login comes back from the saved state. Caller holds no lock needs."""
+    for obj in (State.ctx, State.browser):
+        if obj:
+            try:
+                await asyncio.wait_for(obj.close(), 6)
+            except Exception:
+                pass
+    State.login_pages, State.login_active, State.warm = [], False, False
     State.browser = await State.pw.chromium.launch(headless=True, args=LAUNCH_ARGS)
     State.ctx = await make_context()
     State.ctx.on("page", _on_new_page)
@@ -262,11 +283,40 @@ async def lifespan(app: FastAPI):
         State.warm = bool(State.status.get("connected"))
     except Exception:
         pass
+
+
+async def relaunch(reason=""):
+    async with State.lock:
+        if _healthy():
+            return
+        log("[browser] restarting:", reason[:120])
+        await _launch()
+        log("[browser] back. DeepSeek connected:", State.status.get("connected"))
+
+
+async def watchdog():
+    while True:
+        await asyncio.sleep(15)
+        if not _healthy() and not State.lock.locked():
+            try:
+                await relaunch("watchdog")
+            except Exception as e:
+                log("[browser] restart failed:", type(e).__name__, str(e)[:100])
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    if not API_KEYS:
+        raise RuntimeError("Set the MY_API_KEY environment variable first.")
+    State.http = httpx.AsyncClient(follow_redirects=True, timeout=30)
+    await KV.start()
+    State.pw = await async_playwright().start()
+    await _launch()
     log("[boot] DeepSeek connected:", State.status.get("connected"))
     await load_tg_state()
     await load_cfg()
     start_telegram()
-    State.tasks = [asyncio.create_task(background_loop())]
+    State.tasks = [asyncio.create_task(background_loop()), asyncio.create_task(watchdog())]
     yield
     for t in State.tasks + [getattr(State, 'tg_task', None)]:
         if t:
@@ -413,11 +463,28 @@ async def _send_and_wait(page, prompt: str, think: bool, search: bool, on_delta=
             pass
 
 
-async def ask_deepseek(message: str, chat_url: str | None = None, think: bool = False,
-                       search: bool = False, system: bool = True, extra_system: str = "",
-                       agent: bool = False, on_delta=None, stateless: bool = False) -> dict:
-    page = State.page
+async def ask_deepseek(*a, **k) -> dict:
+    """Ask DeepSeek. If the browser died (out of memory, crash, redeploy), restart it and retry once."""
+    for attempt in (0, 1):
+        try:
+            return await _ask_once(*a, **k)
+        except HTTPException:
+            raise
+        except Exception as e:
+            if attempt == 0 and _is_dead(e):
+                await relaunch(str(e))
+                continue
+            raise
+
+
+async def _ask_once(message: str, chat_url: str | None = None, think: bool = False,
+                    search: bool = False, system: bool = True, extra_system: str = "",
+                    agent: bool = False, on_delta=None, stateless: bool = False) -> dict:
     async with State.lock:  # one message at a time
+        if not _healthy():
+            log("[browser] not healthy before request, restarting")
+            await _launch()
+        page = State.page
         new_chat = not (chat_url and chat_url.startswith(SITE))
         if new_chat:
             if not State.warm:
@@ -468,7 +535,9 @@ async def ask_deepseek(message: str, chat_url: str | None = None, think: bool = 
             "features": features,
         }
         State.status["connected"] = True
-    await save_state()
+    if time.time() - getattr(State, "saved_at", 0) > 120:      # saving is slow: do it in the background
+        State.saved_at = time.time()
+        asyncio.create_task(save_state())
     if stateless:
         asyncio.create_task(_prewarm())
     return result
