@@ -465,10 +465,14 @@ async def _send_and_wait(page, prompt: str, think: bool, search: bool, on_delta=
 
 async def ask_deepseek(*a, **k) -> dict:
     """Ask DeepSeek. If the browser died (out of memory, crash, redeploy), restart it and retry once."""
+    t0 = time.time()
     for attempt in (0, 1):
         try:
-            return await _ask_once(*a, **k)
-        except HTTPException:
+            r = await _ask_once(*a, **k)
+            diag_add("deepseek", time.time() - t0, True, f"{len(r.get('reply', ''))} chars")
+            return r
+        except HTTPException as e:
+            diag_add("deepseek", time.time() - t0, False, f"{e.status_code} {e.detail}")
             raise
         except Exception as e:
             if attempt == 0 and _is_dead(e):
@@ -961,6 +965,16 @@ async def api_build(body: BuildIn, authorization: str | None = Header(default=No
 # ---------------- saved settings (tokens live in the Key Value store, never in the page) ----------------
 CFG: dict = {"github_token": "", "render_key": "", "telegram_token": "", "tg_ids": [], "pair_code": "",
              "github_login": "", "tg_username": ""}
+from collections import deque
+DIAG: deque = deque(maxlen=30)
+BOOT_AT = time.time()
+
+
+def diag_add(kind, secs, ok, note=""):
+    DIAG.append({"at": time.strftime("%H:%M:%S", time.gmtime()), "kind": kind, "secs": round(secs, 1), "ok": ok, "note": note[:120]})
+    log(f"[diag] {kind} {secs:.1f}s ok={ok} {note[:100]}")
+
+
 TG_OWNER = int(os.getenv("TELEGRAM_OWNER_ID", "8978770775"))   # always allowed
 TG_ALLOWED: set = set()
 PAIR_FAILS: dict = {}
@@ -1059,6 +1073,13 @@ def _cfg_view() -> dict:
             "render": {"set": bool(CFG.get("render_key") or os.getenv("RENDER_API_KEY"))},
             "telegram": {"set": bool(CFG.get("telegram_token")), "username": CFG.get("tg_username", ""),
                          "paired": len(TG_ALLOWED), "pair_code": CFG.get("pair_code", "")}}
+
+
+@app.get("/diag")
+async def get_diag(authorization: str | None = Header(default=None)):
+    check_key(authorization)
+    return {"browser_ok": _healthy(), "deepseek_connected": State.status.get("connected"), "busy": State.lock.locked(),
+            "uptime_min": int((time.time() - BOOT_AT) / 60), "recent": list(DIAG)}
 
 
 @app.get("/config")
@@ -1176,6 +1197,12 @@ async def handle_tg(call, allowed, upd):
             "/mode auto|agent|chat   /new   /think on|off   /search on|off\n"
             "Say 'draw a ...' for an image or 'send 5 anime pics from pinterest' for photos."))
         return
+    if cmd == "/diag":
+        rows = "\n".join(f"{d['at']} {d['kind']} {d['secs']}s {'ok' if d['ok'] else 'FAIL'} {d['note']}" for d in list(DIAG)[-8:])
+        await call("sendMessage", chat_id=chat_id, text=(
+            f"Browser: {'ok' if _healthy() else 'DOWN'} | DeepSeek login: {State.status.get('connected')} | "
+            f"busy: {State.lock.locked()} | up {int((time.time() - BOOT_AT) / 60)} min\n{rows or 'no requests yet'}"))
+        return
     if cmd == "/mode":
         if arg in ("auto", "chat", "agent"):
             st["mode"], st["mode_set"] = arg, True
@@ -1210,27 +1237,34 @@ async def tg_react(call, chat_id, mid, emoji):
 
 
 async def tg_photos(call, chat_id, pics, caption=""):
-    """Send real photos: URLs as an album, and if Telegram can't fetch them, download and upload."""
-    urls = [x["url"] for x in pics][:10]
-    if len(urls) > 1:
-        r = await call("sendMediaGroup", chat_id=chat_id,
-                       media=[{"type": "photo", "media": u, **({"caption": caption[:200]} if i == 0 else {})}
-                              for i, u in enumerate(urls)])
-        if r.get("ok"):
-            return len(urls)
-    elif urls:
-        r = await call("sendPhoto", chat_id=chat_id, photo=urls[0], caption=caption[:200])
-        if r.get("ok"):
-            return 1
-    sent = 0
-    for x in pics[:10]:
+    """Send real photos as one album. Telegram can't fetch Pinterest links itself, so download in parallel and upload."""
+    async def grab(x):
         try:
-            data, ctype = await fetch_bytes(State.http, x["url"])
+            return await asyncio.wait_for(fetch_bytes(State.http, x["url"]), 25)
         except Exception:
-            continue
+            return None
+    got = [(x, d) for x, d in zip(pics[:10], await asyncio.gather(*[grab(x) for x in pics[:10]])) if d]
+    if len(got) > 1:
+        files, media = {}, []
+        for i, (x, (data, ctype)) in enumerate(got):
+            files[f"p{i}"] = (f"pic{i}.jpg", data, ctype)
+            media.append({"type": "photo", "media": f"attach://p{i}", **({"caption": caption[:200]} if i == 0 else {})})
+        r = await call("sendMediaGroup", chat_id=chat_id, media=media, files=files)
+        if r.get("ok"):
+            return len(got)
+    sent = 0
+    for x, (data, ctype) in got:
         r = await call("sendPhoto", chat_id=chat_id, caption=(caption if not sent else "")[:200],
                        files={"photo": ("pic.jpg", data, ctype)})
         sent += 1 if r.get("ok") else 0
+    if not sent:                       # last resort: let Telegram try the links itself
+        urls = [x["url"] for x in pics][:10]
+        if len(urls) > 1:
+            r = await call("sendMediaGroup", chat_id=chat_id,
+                           media=[{"type": "photo", "media": u} for u in urls])
+        else:
+            r = await call("sendPhoto", chat_id=chat_id, photo=urls[0]) if urls else {}
+        sent = len(urls) if r.get("ok") else 0
     return sent
 
 
@@ -1264,7 +1298,7 @@ async def tg_work(call, chat_id, mid, text, st):
         if status["id"]:
             anim = asyncio.create_task(animate())
     await tg_react(call, chat_id, mid, "👨‍💻" if use_agent else "🤩" if kind == "image" else "🤔")
-    ok = True
+    ok, note, t0 = True, "", time.time()
     try:
         async def work():
             if use_agent:
@@ -1294,10 +1328,10 @@ async def tg_work(call, chat_id, mid, text, st):
         ok = False
         await call("sendMessage", chat_id=chat_id, text="That took too long. Try again, or send /new.")
     except HTTPException as e:
-        ok = False
+        ok, note = False, f"{e.status_code} {e.detail}"
         await call("sendMessage", chat_id=chat_id, text=f"Error: {e.detail}")
     except Exception as e:
-        ok = False
+        ok, note = False, f"{type(e).__name__} {e}"
         log("[telegram] work error:", type(e).__name__, str(e)[:200])
         await call("sendMessage", chat_id=chat_id, text=f"Error: {e}")
     finally:
@@ -1306,6 +1340,7 @@ async def tg_work(call, chat_id, mid, text, st):
             anim.cancel()
         if status["id"]:
             await call("deleteMessage", chat_id=chat_id, message_id=status["id"])
+    diag_add("tg-" + ("agent" if use_agent else kind), time.time() - t0, ok, note or text[:40])
     await tg_react(call, chat_id, mid, "🔥" if ok else "😢")
 
 
