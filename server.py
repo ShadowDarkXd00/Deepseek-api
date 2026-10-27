@@ -34,6 +34,7 @@ from shadow import (BOT_NAME, BOT_MAKER, JS_GRAB, JS_TOGGLE, REMINDER, SEARCH_LA
                     build_convo, clean_html, clean_reply, detect_intent, extract_files, flags_from_model,
                     has_cjk_prose, html_to_md, is_agent_request, md_to_tg, slugify, split_md, with_system)
 from media import MediaError, fetch_bytes, generate_image, img_path, search_pictures, sign
+import agent as AG
 from integrations import GitHub, IntegrationError, RenderAPI
 
 # ---------- CONFIG ----------
@@ -263,10 +264,13 @@ async def lifespan(app: FastAPI):
         pass
     log("[boot] DeepSeek connected:", State.status.get("connected"))
     await load_tg_state()
-    State.tasks = [asyncio.create_task(telegram_loop()), asyncio.create_task(background_loop())]
+    await load_cfg()
+    start_telegram()
+    State.tasks = [asyncio.create_task(background_loop())]
     yield
-    for t in State.tasks:
-        t.cancel()
+    for t in State.tasks + [getattr(State, 'tg_task', None)]:
+        if t:
+            t.cancel()
     await save_state()
     await State.browser.close()
     await State.pw.stop()
@@ -327,8 +331,8 @@ async def status(authorization: str | None = Header(default=None)):
     if not State.lock.locked() and time.time() - State.status_at > 20:
         await refresh_status()
     return {**State.status, "features": {
-        "store": bool(KV.r), "telegram": bool(os.getenv("TELEGRAM_BOT_TOKEN")),
-        "github": bool(os.getenv("GITHUB_TOKEN")), "render": bool(os.getenv("RENDER_API_KEY")),
+        "store": bool(KV.r), "telegram": bool(CFG.get("telegram_token")),
+        "github": bool(CFG.get("github_token") or os.getenv("GITHUB_TOKEN")), "render": bool(CFG.get("render_key") or os.getenv("RENDER_API_KEY")),
         "image_key": bool(os.getenv("POLLINATIONS_KEY"))}}
 
 
@@ -747,24 +751,6 @@ async def pins_get(query: str, n: int = 5, key: str | None = None, authorization
 
 
 # ---------------- GitHub + Render ----------------
-def gh() -> GitHub:
-    return GitHub(State.http)
-
-
-def rn() -> RenderAPI:
-    return RenderAPI(State.http)
-
-
-async def render_owner() -> str:
-    o = os.getenv("RENDER_OWNER_ID", "").strip()
-    if o:
-        return o
-    svcs = await rn().services(5)
-    if not svcs:
-        raise IntegrationError("No Render services found to read the workspace from. Set RENDER_OWNER_ID.")
-    return svcs[0]["owner"]
-
-
 async def do_push(repo: str, md: str, message: str = "", branch: str | None = None) -> dict:
     files = extract_files(md)
     res = await gh().commit_files(repo, files, message or "Update by ShadowV1", branch)
@@ -903,7 +889,156 @@ async def api_build(body: BuildIn, authorization: str | None = Header(default=No
     return await respond_json(guard(do_build(body.idea, body.private, body.think)), lambda r: r)
 
 
-# ---------------- Telegram bot (compact) ----------------
+# ---------------- saved settings (tokens live in the Key Value store, never in the page) ----------------
+CFG: dict = {"github_token": "", "render_key": "", "telegram_token": "", "tg_ids": [], "pair_code": "",
+             "github_login": "", "tg_username": ""}
+TG_ALLOWED: set = set()
+PAIR_FAILS: dict = {}
+
+
+async def load_cfg():
+    try:
+        raw = await KV.get("shadowv1:cfg")
+        if raw:
+            CFG.update(json.loads(raw))
+    except Exception:
+        pass
+    CFG["telegram_token"] = CFG.get("telegram_token") or os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+    TG_ALLOWED.clear()
+    TG_ALLOWED.update(int(x) for x in CFG.get("tg_ids", []))
+    TG_ALLOWED.update(int(x) for x in re.findall(r"-?\d+", os.getenv("TELEGRAM_ALLOWED_IDS", "")))
+
+
+async def save_cfg():
+    CFG["tg_ids"] = sorted(TG_ALLOWED)
+    await KV.set("shadowv1:cfg", json.dumps(CFG))
+
+
+def gh() -> GitHub:
+    return GitHub(State.http, CFG.get("github_token") or None)
+
+
+def rn() -> RenderAPI:
+    return RenderAPI(State.http, CFG.get("render_key") or None)
+
+
+async def render_owner() -> str:
+    o = os.getenv("RENDER_OWNER_ID", "").strip()
+    if o:
+        return o
+    svcs = await rn().services(5)
+    if not svcs:
+        raise IntegrationError("No Render services found to read the workspace from. Set RENDER_OWNER_ID.")
+    return svcs[0]["owner"]
+
+
+# ---------------- AI agent mode (GitHub, Render, terminal). Only here, never in plain chat ----------------
+AGENT_SESS: dict = {}
+
+
+async def agent_ask(message, url, first, think=False):
+    return await ask_deepseek(message, url, think, False, True, AG.PROTOCOL if first else "", True)
+
+
+async def run_agent(key: str, message: str, think: bool = False, emit=None) -> dict:
+    sess = AGENT_SESS.setdefault(key, {"url": None, "pending": None, "lock": asyncio.Lock()})
+    steps: list = []
+
+    async def _emit(t):
+        steps.append(t)
+        if emit:
+            await emit(t)
+    async with sess["lock"]:
+        res = await AG.drive(sess, message, lambda m, u, f: agent_ask(m, u, f, think),
+                             AG.Toolbox(gh, rn), _emit)
+    res["steps"] = steps
+    res["reply"] = clean_reply(res.get("reply", ""))
+    return res
+
+
+class AgentIn(BaseModel):
+    message: str
+    session: str = "web"
+    think: bool = False
+
+
+@app.post("/agent")
+async def api_agent(body: AgentIn, authorization: str | None = Header(default=None)):
+    check_key(authorization)
+    return await respond_json(run_agent("web:" + body.session[:40], body.message, body.think), lambda r: r)
+
+
+@app.post("/agent/reset")
+async def api_agent_reset(session: str = "web", authorization: str | None = Header(default=None)):
+    check_key(authorization)
+    AGENT_SESS.pop("web:" + session[:40], None)
+    return {"ok": True}
+
+
+class CfgIn(BaseModel):
+    github_token: str | None = None
+    render_key: str | None = None
+    telegram_token: str | None = None
+
+
+def _cfg_view() -> dict:
+    return {"store": bool(KV.r),
+            "github": {"set": bool(CFG.get("github_token") or os.getenv("GITHUB_TOKEN")), "login": CFG.get("github_login", "")},
+            "render": {"set": bool(CFG.get("render_key") or os.getenv("RENDER_API_KEY"))},
+            "telegram": {"set": bool(CFG.get("telegram_token")), "username": CFG.get("tg_username", ""),
+                         "paired": len(TG_ALLOWED), "pair_code": CFG.get("pair_code", "")}}
+
+
+@app.get("/config")
+async def get_config(authorization: str | None = Header(default=None)):
+    check_key(authorization)
+    return _cfg_view()
+
+
+@app.post("/config")
+async def set_config(body: CfgIn, authorization: str | None = Header(default=None)):
+    check_key(authorization)
+    if body.github_token is not None:
+        tok = body.github_token.strip()
+        if tok:
+            CFG["github_login"] = await guard(GitHub(State.http, tok).me())
+        else:
+            CFG["github_login"] = ""
+        CFG["github_token"] = tok
+    if body.render_key is not None:
+        CFG["render_key"] = body.render_key.strip()
+        if CFG["render_key"]:
+            await guard(RenderAPI(State.http, CFG["render_key"]).services(1))
+    if body.telegram_token is not None:
+        tok = body.telegram_token.strip()
+        if tok:
+            r = await State.http.post(f"https://api.telegram.org/bot{tok}/getMe", timeout=20)
+            j = r.json()
+            if not j.get("ok"):
+                raise HTTPException(400, "Telegram rejected that token. Copy it again from @BotFather.")
+            if tok != CFG.get("telegram_token"):
+                TG_ALLOWED.clear()
+            CFG["tg_username"] = (j.get("result") or {}).get("username", "")
+            CFG["pair_code"] = secrets.token_hex(4)
+        else:
+            CFG["tg_username"], CFG["pair_code"] = "", ""
+            TG_ALLOWED.clear()
+        CFG["telegram_token"] = tok
+        start_telegram()
+    await save_cfg()
+    return _cfg_view()
+
+
+@app.post("/config/unpair")
+async def unpair(authorization: str | None = Header(default=None)):
+    check_key(authorization)
+    TG_ALLOWED.clear()
+    CFG["pair_code"] = secrets.token_hex(4) if CFG.get("telegram_token") else ""
+    await save_cfg()
+    return _cfg_view()
+
+
+# ---------------- Telegram bot ----------------
 TG_STATE: dict = {}
 
 
@@ -932,20 +1067,46 @@ async def handle_tg(call, allowed, upd):
     uid = (msg.get("from") or {}).get("id")
     if not text or chat_id is None:
         return
+    parts = text.split()
     if uid not in allowed:
-        await call("sendMessage", chat_id=chat_id,
-                   text=f"Private bot. Your Telegram ID is {uid}. Add it to TELEGRAM_ALLOWED_IDS on Render.")
+        if parts[0].split("@")[0].lower() == "/pair" and len(parts) > 1 and CFG.get("pair_code"):
+            now = time.time()
+            fails = [t for t in PAIR_FAILS.get(uid, []) if now - t < 600]
+            if len(fails) >= 5:
+                await call("sendMessage", chat_id=chat_id, text="Too many tries. Wait 10 minutes.")
+            elif secrets.compare_digest(parts[1].strip().lower(), CFG["pair_code"]):
+                allowed.add(uid)
+                CFG["pair_code"] = secrets.token_hex(4)       # one-time code
+                await save_cfg()
+                await call("sendMessage", chat_id=chat_id,
+                           text=f"Paired. Welcome to {BOT_NAME} by {BOT_MAKER}. Send /help.")
+            else:
+                PAIR_FAILS[uid] = fails + [now]
+                await call("sendMessage", chat_id=chat_id, text="Wrong code.")
+        else:
+            await call("sendMessage", chat_id=chat_id,
+                       text="Private bot. Open your ShadowV1 website, go to the Agent page, and send me: /pair CODE")
         return
-    st = TG_STATE.setdefault(chat_id, {"url": None, "think": False, "search": False})
-    cmd = text.split()[0].split("@")[0].lower() if text.startswith("/") else ""
-    arg = text.split()[1].lower() if len(text.split()) > 1 else ""
+    st = TG_STATE.setdefault(chat_id, {"url": None, "think": False, "search": False, "mode": "agent"})
+    st.setdefault("mode", "agent")
+    cmd = parts[0].split("@")[0].lower() if text.startswith("/") else ""
+    arg = parts[1].lower() if len(parts) > 1 else ""
     if cmd in ("/start", "/help"):
         await call("sendMessage", chat_id=chat_id, text=(
-            f"{BOT_NAME} by {BOT_MAKER}. Send any message.\n/new new chat\n/think on|off\n/search on|off\n"
+            f"{BOT_NAME} by {BOT_MAKER}.\n"
+            "Agent mode (default): tell me a task. I can use GitHub, Render and a build terminal.\n"
+            "Deletes and merges always ask you to reply YES first.\n"
+            "/mode chat | agent   /new   /think on|off   /search on|off (chat mode)\n"
             "Say 'draw a ...' for images or 'find 5 anime pics' for pictures."))
+        return
+    if cmd == "/mode":
+        if arg in ("chat", "agent"):
+            st["mode"] = arg
+        await call("sendMessage", chat_id=chat_id, text=f"Mode: {st['mode']}")
         return
     if cmd == "/new":
         st["url"] = None
+        AGENT_SESS.pop(f"tg:{chat_id}", None)
         await call("sendMessage", chat_id=chat_id, text="New chat started.")
         return
     if cmd in ("/think", "/search"):
@@ -957,10 +1118,18 @@ async def handle_tg(call, allowed, upd):
         text = text.lstrip("/")
     typing = asyncio.create_task(_typing(call, chat_id))
     try:
-        res = await smart_chat(text, st["url"], st["think"], st["search"])
-        if res.get("type") == "chat":
-            st["url"] = res["chat_url"]
-        await tg_send(call, chat_id, res["reply"])
+        sess = AGENT_SESS.get(f"tg:{chat_id}")
+        kind = detect_intent(text)[0]
+        if st["mode"] == "agent" and (kind == "chat" or (sess and sess.get("pending"))):
+            async def emit(t):
+                await call("sendMessage", chat_id=chat_id, text="🔧 " + t[:300])
+            res = await run_agent(f"tg:{chat_id}", text, st["think"], emit)
+            await tg_send(call, chat_id, res["reply"])
+        else:
+            res = await smart_chat(text, st["url"], st["think"], st["search"])
+            if res.get("type") == "chat":
+                st["url"] = res["chat_url"]
+            await tg_send(call, chat_id, res["reply"])
     except HTTPException as e:
         await call("sendMessage", chat_id=chat_id, text=f"Error: {e.detail}")
     except Exception as e:
@@ -976,12 +1145,18 @@ async def _typing(call, chat_id):
         await asyncio.sleep(4)
 
 
+def start_telegram():
+    t = getattr(State, "tg_task", None)
+    if t:
+        t.cancel()
+    State.tg_task = asyncio.create_task(telegram_loop())
+
+
 async def telegram_loop():
-    token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+    token = (CFG.get("telegram_token") or "").strip()
     if not token:
-        log("[telegram] off (no TELEGRAM_BOT_TOKEN)")
+        log("[telegram] off (no token yet; add it on the Agent page)")
         return
-    allowed = {int(x) for x in re.findall(r"-?\d+", os.getenv("TELEGRAM_ALLOWED_IDS", ""))}
 
     async def call(method, **kw):
         try:
@@ -990,13 +1165,15 @@ async def telegram_loop():
             if not j.get("ok"):
                 log(f"[telegram] {method}: {j.get('description')}")
             return j
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             log(f"[telegram] {method} error: {type(e).__name__}")
             return {}
 
     await call("deleteWebhook")
     me = await call("getMe")
-    log("[telegram] bot ready:", (me.get("result") or {}).get("username"), "allowed ids:", len(allowed))
+    log("[telegram] bot ready:", (me.get("result") or {}).get("username"), "paired ids:", len(TG_ALLOWED))
     offset = 0
     while True:
         data = await call("getUpdates", offset=offset, timeout=30, allowed_updates=["message"])
@@ -1005,7 +1182,7 @@ async def telegram_loop():
             continue
         for u in data.get("result", []):
             offset = u["update_id"] + 1
-            asyncio.create_task(handle_tg(call, allowed, u))
+            asyncio.create_task(handle_tg(call, TG_ALLOWED, u))
 
 
 # ---------------- connect via your own Chrome ----------------
@@ -1232,6 +1409,11 @@ async def connect_page():
 @app.get("/guide")
 async def guide_page():
     return FileResponse(HERE / "guide.html")
+
+
+@app.get("/agent")
+async def agent_page():
+    return FileResponse(HERE / "agent.html")
 
 
 @app.get("/import")

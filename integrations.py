@@ -198,3 +198,146 @@ class RenderAPI:
         s = j.get("service", j)
         return {"id": s.get("id"), "name": s.get("name"),
                 "url": (s.get("serviceDetails") or {}).get("url", ""), "dashboard": s.get("dashboardUrl", "")}
+
+
+# ---------------- GitHub toolkit (files, branches, PRs, issues). Destructive calls are gated in agent.py ----------------
+from urllib.parse import quote as _q
+
+
+async def _default_branch(self, repo):
+    return (await self._req("GET", f"/repos/{repo}")).json().get("default_branch", "main")
+
+
+async def _tree(self, repo, ref=None, limit=300):
+    ref = ref or await self._default_branch(repo)
+    r = await self._req("GET", f"/repos/{repo}/git/trees/{_q(ref, safe='')}", params={"recursive": "1"},
+                        ok=(200, 404, 409))
+    if r.status_code != 200:
+        return {"files": [], "truncated": False, "note": "empty repo or unknown branch"}
+    t = [x["path"] for x in r.json().get("tree", []) if x.get("type") == "blob"]
+    return {"files": t[:limit], "truncated": len(t) > limit, "total": len(t)}
+
+
+async def _read_file(self, repo, path, ref=None, max_chars=12000):
+    r = await self._req("GET", f"/repos/{repo}/contents/{_q(path.strip('/'))}",
+                        params={"ref": ref} if ref else None)
+    j = r.json()
+    if isinstance(j, list):
+        return {"type": "dir", "entries": [f"{x['name']}{'/' if x['type'] == 'dir' else ''}" for x in j]}
+    try:
+        text = base64.b64decode(j.get("content", "")).decode("utf-8")
+    except Exception:
+        return {"type": "binary", "size": j.get("size")}
+    return {"type": "file", "size": j.get("size"), "content": text[:max_chars], "truncated": len(text) > max_chars}
+
+
+async def _write_file(self, repo, path, content, message="Update by ShadowV1", branch=None):
+    path = path.strip("/")
+    params = {"ref": branch} if branch else None
+    cur = await self._req("GET", f"/repos/{repo}/contents/{_q(path)}", params=params, ok=(200, 404))
+    body = {"message": message, "content": base64.b64encode(content.encode()).decode()}
+    if branch:
+        body["branch"] = branch
+    if cur.status_code == 200 and isinstance(cur.json(), dict):
+        body["sha"] = cur.json().get("sha")
+    r = await self._req("PUT", f"/repos/{repo}/contents/{_q(path)}", json=body)
+    return {"path": path, "updated": "sha" in body, "commit": (r.json().get("commit") or {}).get("html_url")}
+
+
+async def _delete_file(self, repo, path, message="Delete by ShadowV1", branch=None):
+    path = path.strip("/")
+    params = {"ref": branch} if branch else None
+    cur = await self._req("GET", f"/repos/{repo}/contents/{_q(path)}", params=params)
+    body = {"message": message, "sha": cur.json().get("sha")}
+    if branch:
+        body["branch"] = branch
+    await self._req("DELETE", f"/repos/{repo}/contents/{_q(path)}", json=body)
+    return {"deleted": path}
+
+
+async def _delete_repo(self, repo):
+    await self._req("DELETE", f"/repos/{repo}", ok=(204,))
+    return {"deleted_repo": repo}
+
+
+async def _branches(self, repo):
+    r = await self._req("GET", f"/repos/{repo}/branches", params={"per_page": 50})
+    return [b["name"] for b in r.json()]
+
+
+async def _create_branch(self, repo, name, source=None):
+    source = source or await self._default_branch(repo)
+    sha = (await self._req("GET", f"/repos/{repo}/git/ref/heads/{_q(source, safe='')}")).json()["object"]["sha"]
+    await self._req("POST", f"/repos/{repo}/git/refs", json={"ref": f"refs/heads/{name}", "sha": sha})
+    return {"branch": name, "from": source}
+
+
+async def _delete_branch(self, repo, name):
+    await self._req("DELETE", f"/repos/{repo}/git/refs/heads/{_q(name, safe='/')}", ok=(204,))
+    return {"deleted_branch": name}
+
+
+async def _create_pr(self, repo, title, head, base=None, body=""):
+    base = base or await self._default_branch(repo)
+    j = (await self._req("POST", f"/repos/{repo}/pulls",
+                         json={"title": title, "head": head, "base": base, "body": body})).json()
+    return {"number": j["number"], "url": j["html_url"]}
+
+
+async def _merge_pr(self, repo, number, method="squash"):
+    await self._req("PUT", f"/repos/{repo}/pulls/{int(number)}/merge", json={"merge_method": method})
+    return {"merged": int(number)}
+
+
+async def _issues(self, repo, state="open", n=15):
+    r = await self._req("GET", f"/repos/{repo}/issues", params={"state": state, "per_page": n})
+    return [{"number": x["number"], "title": x["title"], "pr": "pull_request" in x, "url": x["html_url"]}
+            for x in r.json()]
+
+
+async def _create_issue(self, repo, title, body=""):
+    j = (await self._req("POST", f"/repos/{repo}/issues", json={"title": title, "body": body})).json()
+    return {"number": j["number"], "url": j["html_url"]}
+
+
+for _f in (_default_branch, _tree, _read_file, _write_file, _delete_file, _delete_repo, _branches,
+           _create_branch, _delete_branch, _create_pr, _merge_pr, _issues, _create_issue):
+    setattr(GitHub, _f.__name__.lstrip("_"), _f)
+
+
+async def _run_logs(self, repo, run_id=None, tail=5000):
+    """Debug a build: which job/step failed, plus the end of that job's log."""
+    if not run_id:
+        rr = (await self._req("GET", f"/repos/{repo}/actions/runs", params={"per_page": 1})).json()
+        runs = rr.get("workflow_runs", [])
+        if not runs:
+            return {"note": "no workflow runs yet"}
+        run_id = runs[0]["id"]
+    jobs = (await self._req("GET", f"/repos/{repo}/actions/runs/{int(run_id)}/jobs")).json().get("jobs", [])
+    out = {"run_id": run_id, "jobs": []}
+    for j in jobs:
+        item = {"name": j["name"], "status": j["status"], "conclusion": j.get("conclusion"),
+                "failed_steps": [s["name"] for s in j.get("steps", []) if s.get("conclusion") == "failure"]}
+        if j.get("conclusion") == "failure":
+            r = await self._req("GET", f"/repos/{repo}/actions/jobs/{j['id']}/logs", ok=(200, 404, 410))
+            if r.status_code == 200:
+                item["log_tail"] = r.text[-tail:]
+        out["jobs"].append(item)
+    return out
+
+
+async def _releases(self, repo, n=5):
+    r = await self._req("GET", f"/repos/{repo}/releases", params={"per_page": n})
+    return [{"tag": x["tag_name"], "url": x["html_url"],
+             "assets": [{"name": a["name"], "download": a["browser_download_url"], "size": a["size"]}
+                        for a in x.get("assets", [])]} for x in r.json()]
+
+
+async def _artifacts(self, repo, n=5):
+    r = await self._req("GET", f"/repos/{repo}/actions/artifacts", params={"per_page": n})
+    return [{"name": a["name"], "size": a["size_in_bytes"], "expired": a["expired"],
+             "run": (a.get("workflow_run") or {}).get("id"), "page": f"https://github.com/{repo}/actions/runs/"
+             f"{(a.get('workflow_run') or {}).get('id')}"} for a in r.json().get("artifacts", [])]
+
+
+GitHub.run_logs, GitHub.releases, GitHub.artifacts = _run_logs, _releases, _artifacts
