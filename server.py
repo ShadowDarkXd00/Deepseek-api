@@ -1,25 +1,22 @@
 """
-ShadowV1 by Vortex: your own website + API + Telegram bot on top of the DeepSeek web chat.
+ShadowV1 provider API: use your DeepSeek web chat as an OpenAI-compatible provider
+(VS Code Cline/Roo/Continue, OpenCode, AntiGem custom provider, any app).
 
-  /                      chat website
-  /<anything>?key=KEY    prompt URL:  https://HOST/write a poem?key=KEY   (also ?think=1 &search=1)
-  /v1/chat/completions   OpenAI-compatible (also without /v1). Works with Cline / Continue / Roo in VS Code
-  /v1/images/generations image generation   |   /img/<prompt>?key=KEY
-  /pins/<query>?n=5&key= picture search     |   /build, /github/*, /render/*  (needs tokens)
-  /guide /connect /remote  help and sign-in pages
+  POST /v1/chat/completions   chat (streaming works), with native tool calling for coding agents
+  GET  /v1/models             model list (shadowv1, shadowv1-think, shadowv1-search, shadowv1-think-search)
+  /                           info page: base URL, key, test button     /connect /remote  sign-in pages
 
-Env vars: MY_API_KEY (required), REDIS_URL (keeps your login across restarts), TELEGRAM_BOT_TOKEN,
-TELEGRAM_ALLOWED_IDS, GITHUB_TOKEN, RENDER_API_KEY, POLLINATIONS_KEY (optional), IMAGE_MODEL (optional)
+Env vars: MY_API_KEY (required, comma = several keys), REDIS_URL (keeps your DeepSeek login across restarts)
+The full bot (Telegram, agent, GitHub, images) lives on the git branch `full-bot-backup`.
 """
 import asyncio
 import base64
 import json
 import os
-import random
 import re
 import secrets
 import time
-from collections import OrderedDict
+from collections import deque
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -30,13 +27,10 @@ from pydantic import BaseModel
 from playwright.async_api import async_playwright
 import httpx
 
+import toolcalls as TC
 from shadow import (BOT_NAME, BOT_MAKER, JS_GRAB, JS_TOGGLE, REMINDER, SEARCH_LABELS, THINK_LABELS,
-                    build_convo, clean_html, clean_reply, detect_intent, extract_files, flags_from_model,
-                    has_cjk_prose, html_to_md, is_agent_request, md_to_tg, slugify, split_md, with_system)
-from media import MediaError, fetch_bytes, generate_image, img_path, search_pictures, sign
-import agent as AG
-import anthropic_api as AN
-from integrations import GitHub, IntegrationError, RenderAPI
+                    build_convo, clean_html, clean_reply, flags_from_model, has_cjk_prose, html_to_md,
+                    is_agent_request, with_system)
 
 # ---------- CONFIG ----------
 API_KEYS = [k.strip() for k in os.getenv("MY_API_KEY", "").split(",") if k.strip()]  # comma = several keys
@@ -104,6 +98,16 @@ def log(*a):
     print(*a, flush=True)
 
 
+DIAG: deque = deque(maxlen=30)
+BOOT_AT = time.time()
+
+
+def diag_add(kind, secs, ok, note=""):
+    DIAG.append({"at": time.strftime("%H:%M:%S", time.gmtime()), "kind": kind, "secs": round(secs, 1),
+                 "ok": ok, "note": note[:120]})
+    log(f"[diag] {kind} {secs:.1f}s ok={ok} {note[:100]}")
+
+
 class State:
     pw = None
     browser = None
@@ -113,7 +117,6 @@ class State:
     login_pages: list = []
     login_active = False
     lock = asyncio.Lock()
-    img_sem = asyncio.Semaphore(2)
     codes: dict = {}                      # one-time /connect codes -> expiry
     status = {"connected": None, "account": None}
     status_at = 0.0
@@ -314,14 +317,10 @@ async def lifespan(app: FastAPI):
     State.pw = await async_playwright().start()
     await _launch()
     log("[boot] DeepSeek connected:", State.status.get("connected"))
-    await load_tg_state()
-    await load_cfg()
-    start_telegram()
     State.tasks = [asyncio.create_task(background_loop()), asyncio.create_task(watchdog())]
     yield
-    for t in State.tasks + [getattr(State, 'tg_task', None)]:
-        if t:
-            t.cancel()
+    for t in State.tasks:
+        t.cancel()
     await save_state()
     await State.browser.close()
     await State.pw.stop()
@@ -364,27 +363,20 @@ async def _auth_headers(request, call_next):
     return await call_next(request)
 
 
-async def guard(coro):
-    try:
-        return await coro
-    except (IntegrationError, MediaError) as e:
-        raise HTTPException(400, str(e))
-
-
-def abs_url(path: str) -> str:
-    return (EXTERNAL_URL or "") + path
-
-
 # ---------------- status ----------------
 @app.get("/status")
-async def status(authorization: str | None = Header(default=None)):
-    check_key(authorization)
+async def status(authorization: str | None = Header(default=None), x_api_key: str | None = Header(default=None)):
+    check_key(authorization, None, x_api_key)
     if not State.lock.locked() and time.time() - State.status_at > 20:
         await refresh_status()
-    return {**State.status, "features": {
-        "store": bool(KV.r), "telegram": bool(CFG.get("telegram_token")),
-        "github": bool(CFG.get("github_token") or os.getenv("GITHUB_TOKEN")), "render": bool(CFG.get("render_key") or os.getenv("RENDER_API_KEY")),
-        "image_key": bool(os.getenv("POLLINATIONS_KEY"))}}
+    return {**State.status, "store": bool(KV.r), "browser_ok": _healthy()}
+
+
+@app.get("/diag")
+async def get_diag(authorization: str | None = Header(default=None)):
+    check_key(authorization)
+    return {"browser_ok": _healthy(), "deepseek_connected": State.status.get("connected"), "busy": State.lock.locked(),
+            "uptime_min": int((time.time() - BOOT_AT) / 60), "recent": list(DIAG)}
 
 
 # ---------------- chat core ----------------
@@ -602,76 +594,6 @@ async def respond_json(coro, shape):
     return StreamingResponse(gen(), media_type="application/json")
 
 
-# ---------------- images + pictures ----------------
-IMG_CACHE: OrderedDict = OrderedDict()
-
-
-async def make_image(prompt: str, w=1024, h=1024, seed=None, style=""):
-    seed = seed or random.randint(1, 2_000_000)
-    key = (prompt, w, h, seed, style)
-    if key in IMG_CACHE:
-        IMG_CACHE.move_to_end(key)
-        data, ctype = IMG_CACHE[key]
-    else:
-        async with State.img_sem:
-            data, ctype = await generate_image(State.http, prompt, w, h, seed, style)
-        IMG_CACHE[key] = (data, ctype)
-        while len(IMG_CACHE) > 6:
-            IMG_CACHE.popitem(last=False)
-    return data, ctype, img_path(API_KEYS[0], prompt, w, h, seed, style)
-
-
-@app.get("/media/img")
-async def media_img(prompt: str, w: int = 1024, h: int = 1024, seed: int = 0, style: str = "", sig: str = ""):
-    if not secrets.compare_digest(sig, sign(API_KEYS[0], prompt, w, h, seed, style)):
-        raise HTTPException(403, "Bad link")
-    data, ctype, _ = await guard(make_image(prompt, w, h, seed, style))
-    return Response(data, media_type=ctype, headers={"Cache-Control": "public, max-age=86400"})
-
-
-def _pics_md(query, pics):
-    return "\n\n".join(
-        f"![{query}]({x['url']})" + (f"\n[Open source]({x['link']})" if x.get("link") else "") for x in pics)
-
-
-def _pics_html(pics):
-    return "".join(f'<p><img src="{x["url"]}" referrerpolicy="no-referrer" style="max-width:100%;border-radius:10px"></p>'
-                   for x in pics)
-
-
-async def smart_chat(message, chat_url=None, think=False, search=False, system=True, intent="auto"):
-    """Chat, or (for 'draw ...' / 'find 5 anime pics') images and pictures."""
-    kind, p = ("chat", {}) if intent == "chat" else detect_intent(message)
-    base = {"thinking": "", "thinking_html": "", "chat_url": chat_url, "features": {}}
-    if kind == "image":
-        _, _, path = await guard(make_image(p["prompt"]))
-        url = abs_url(path)
-        return {**base, "type": "image", "reply": f"![{p['prompt'][:80]}]({url})", "images": [url],
-                "html": f'<p><img src="{url}" style="max-width:100%;border-radius:10px"></p>'}
-    if kind == "pins":
-        pics = await guard(search_pictures(State.http, p["query"], p["amount"]))
-        return {**base, "type": "pins", "reply": _pics_md(p["query"], pics), "html": _pics_html(pics),
-                "images": [x["url"] for x in pics]}
-    res = await ask_deepseek(message, chat_url, think, search, system)
-    return {**res, "reply": clean_reply(res["reply"]), "type": "chat", "images": []}
-
-
-class ChatIn(BaseModel):
-    message: str
-    chat_url: str | None = None
-    think: bool = False
-    search: bool = False
-    system: bool = True
-    intent: str = "auto"
-
-
-@app.post("/chat")
-async def chat(body: ChatIn, authorization: str | None = Header(default=None)):
-    check_key(authorization)
-    return await respond_json(
-        smart_chat(body.message, body.chat_url, body.think, body.search, body.system, body.intent), lambda r: r)
-
-
 # ---------------- OpenAI-compatible API (works with Cline, Continue, Roo, any bot) ----------------
 MODELS = ["shadowv1", "shadowv1-think", "shadowv1-search", "shadowv1-think-search"]
 
@@ -679,6 +601,10 @@ MODELS = ["shadowv1", "shadowv1-think", "shadowv1-search", "shadowv1-think-searc
 class OAIMessage(BaseModel):
     role: str
     content: str | list | None = None
+    tool_calls: list | None = None
+    tool_call_id: str | None = None
+    name: str | None = None
+    model_config = {"extra": "allow"}
 
 
 class OAIIn(BaseModel):
@@ -783,13 +709,74 @@ async def _oai_stream(start, model, prompt_len=0, include_usage=False):
     yield "data: [DONE]\n\n"
 
 
+def _tool_payload(model, res, prompt_len, names):
+    text, calls = TC.parse_reply(res["reply"], names)
+    msg = {"role": "assistant", "content": clean_reply(text) if text else None}
+    if calls:
+        msg["tool_calls"] = calls
+    pt, ct = prompt_len // 4, len(res["reply"]) // 4
+    return {"id": f"chatcmpl-{secrets.token_hex(8)}", "object": "chat.completion", "created": int(time.time()),
+            "model": model, "choices": [{"index": 0, "message": msg, "finish_reason": "tool_calls" if calls else "stop"}],
+            "usage": {"prompt_tokens": pt, "completion_tokens": ct, "total_tokens": pt + ct}}
+
+
+async def _tool_stream(model, task, prompt_len, names):
+    """Tool mode can't stream text early (the reply may be a tool call), so keep the line alive, then send it."""
+    cid = f"chatcmpl-{secrets.token_hex(8)}"
+
+    def chunk(delta, finish=None):
+        return "data: " + json.dumps({"id": cid, "object": "chat.completion.chunk", "created": int(time.time()),
+                                      "model": model,
+                                      "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]}) + "\n\n"
+    yield chunk({"role": "assistant", "content": ""})
+    while True:
+        done, _ = await asyncio.wait({task}, timeout=10)
+        if done:
+            break
+        yield ": keep-alive\n\n"
+    try:
+        res = task.result()
+    except HTTPException as e:
+        yield "data: " + json.dumps({"error": {"message": e.detail, "code": e.status_code}}) + "\n\n"
+        yield "data: [DONE]\n\n"
+        return
+    except Exception as e:
+        yield "data: " + json.dumps({"error": {"message": str(e), "code": 500}}) + "\n\n"
+        yield "data: [DONE]\n\n"
+        return
+    p = _tool_payload(model, res, prompt_len, names)["choices"][0]
+    text = p["message"].get("content") or ""
+    for i in range(0, len(text), 400):
+        yield chunk({"content": text[i:i + 400]})
+    for i, c in enumerate(p["message"].get("tool_calls") or []):
+        yield chunk({"tool_calls": [{"index": i, "id": c["id"], "type": "function",
+                                     "function": {"name": c["function"]["name"], "arguments": ""}}]})
+        args = c["function"]["arguments"]
+        for k in range(0, len(args), 400):
+            yield chunk({"tool_calls": [{"index": i, "function": {"arguments": args[k:k + 400]}}]})
+    yield chunk({}, p["finish_reason"])
+    yield "data: [DONE]\n\n"
+
+
 @app.post("/v1/chat/completions")
 @app.post("/chat/completions")
-async def oai(body: OAIIn, authorization: str | None = Header(default=None)):
-    check_key(authorization)
+async def oai(body: OAIIn, authorization: str | None = Header(default=None),
+              x_api_key: str | None = Header(default=None)):
+    check_key(authorization, None, x_api_key)
     think, search = flags_from_model(body.model, body.think, body.search)
+    tools = [t for t in (getattr(body, "tools", None) or []) if isinstance(t, dict)]
+    names = TC.tool_names(tools)
+    if names and getattr(body, "tool_choice", None) != "none":          # native tool calling (OpenCode, AntiGem...)
+        instr, convo = TC.build_prompt(body.messages, tools)
+        plen = len(instr) + len(convo)
+        coro = ask_deepseek(convo, None, think, search, True, instr, True, None, True)
+        if body.stream:
+            return StreamingResponse(_tool_stream(body.model, asyncio.create_task(coro), plen, names),
+                                     media_type="text/event-stream",
+                                     headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+        return await respond_json(coro, lambda r: _tool_payload(body.model, r, plen, names))
     prompt, extra = build_convo(body.messages)
-    agent = is_agent_request(extra, bool(getattr(body, "tools", None)))
+    agent = is_agent_request(extra, False)
     opts = getattr(body, "stream_options", None) or {}
     if body.stream:
         def start(on_delta):
@@ -799,693 +786,6 @@ async def oai(body: OAIIn, authorization: str | None = Header(default=None)):
             media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
     return await respond_json(ask_deepseek(prompt, None, think, search, True, extra, agent, None, True),
                               lambda r: _oai_payload(body.model, r, len(prompt)))
-
-
-# ---------------- Anthropic Messages API (Claude Code, AntiGem's Claude path) ----------------
-class AnthIn(BaseModel):
-    model: str = "shadowv1"
-    messages: list
-    system: str | list | None = None
-    tools: list | None = None
-    stream: bool = False
-    max_tokens: int | None = None
-    model_config = {"extra": "allow"}
-
-
-def _anth_err(status: int, kind: str, msg: str):
-    return JSONResponse({"type": "error", "error": {"type": kind, "message": str(msg)}}, status_code=status)
-
-
-async def anth_run(body: AnthIn, instr: str, convo: str, names: list, in_tokens: int) -> dict:
-    think = "think" in (body.model or "").lower()
-    res = await ask_deepseek(convo, None, think, False, True, instr, True, None, True)
-    blocks, stop = AN.parse_reply(res["reply"], names)
-    return AN.message_obj(body.model, blocks, stop, in_tokens)
-
-
-@app.post("/v1/messages")
-@app.post("/messages")
-async def anth_messages(body: AnthIn, authorization: str | None = Header(default=None),
-                        x_api_key: str | None = Header(default=None)):
-    try:
-        check_key(authorization, None, x_api_key)
-    except HTTPException as e:
-        return _anth_err(401, "authentication_error", e.detail)
-    d = body.model_dump()
-    instr, convo = AN.build_prompt(d)
-    names = [t.get("name") for t in (d.get("tools") or []) if isinstance(t, dict) and t.get("name")]
-    in_tokens = (len(instr) + len(convo)) // 4
-    if not body.stream:
-        try:
-            return await respond_json(anth_run(body, instr, convo, names, in_tokens), lambda r: r)
-        except HTTPException as e:
-            return _anth_err(e.status_code, "api_error", e.detail)
-
-    async def gen():
-        yield AN.start_events(AN.message_obj(body.model, [], "end_turn", in_tokens))
-        task = asyncio.create_task(anth_run(body, instr, convo, names, in_tokens))
-        while True:
-            done, _ = await asyncio.wait({task}, timeout=8)
-            if done:
-                break
-            yield AN.ping()
-        try:
-            msg = task.result()
-        except HTTPException as e:
-            yield AN.error_event(str(e.detail))
-            return
-        except Exception as e:
-            yield AN.error_event(f"{type(e).__name__}: {e}")
-            return
-        for ev in AN.body_events(msg):
-            yield ev
-    return StreamingResponse(gen(), media_type="text/event-stream",
-                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
-
-
-@app.post("/v1/messages/count_tokens")
-@app.post("/messages/count_tokens")
-async def anth_count(body: AnthIn, authorization: str | None = Header(default=None),
-                     x_api_key: str | None = Header(default=None)):
-    try:
-        check_key(authorization, None, x_api_key)
-    except HTTPException as e:
-        return _anth_err(401, "authentication_error", e.detail)
-    instr, convo = AN.build_prompt(body.model_dump())
-    return {"input_tokens": (len(instr) + len(convo)) // 4}
-
-
-class ImgIn(BaseModel):
-    prompt: str
-    n: int = 1
-    size: str = "1024x1024"
-    style: str = ""
-    response_format: str = "url"
-    model_config = {"extra": "allow"}
-
-
-@app.post("/v1/images/generations")
-@app.post("/images/generations")
-async def oai_images(body: ImgIn, authorization: str | None = Header(default=None)):
-    check_key(authorization)
-    m = re.match(r"(\d+)x(\d+)", body.size or "")
-    w, h = (int(m.group(1)), int(m.group(2))) if m else (1024, 1024)
-    data = []
-    for _ in range(max(1, min(body.n, 4))):
-        img, _, path = await guard(make_image(body.prompt, w, h, None, body.style))
-        data.append({"b64_json": base64.b64encode(img).decode()} if body.response_format == "b64_json"
-                    else {"url": abs_url(path)})
-    return {"created": int(time.time()), "data": data}
-
-
-@app.get("/img/{prompt:path}")
-async def img_get(prompt: str, w: int = 1024, h: int = 1024, seed: int = 0, style: str = "",
-                  key: str | None = None, authorization: str | None = Header(default=None),
-                  x_api_key: str | None = Header(default=None)):
-    check_key(authorization, key, x_api_key)
-    data, ctype, _ = await guard(make_image(prompt, w, h, seed or None, style))
-    return Response(data, media_type=ctype)
-
-
-@app.get("/pins/{query:path}")
-async def pins_get(query: str, n: int = 5, key: str | None = None, authorization: str | None = Header(default=None),
-                   x_api_key: str | None = Header(default=None)):
-    check_key(authorization, key, x_api_key)
-    pics = await guard(search_pictures(State.http, query, n))
-    return {"query": query, "count": len(pics), "results": pics}
-
-
-# ---------------- GitHub + Render ----------------
-async def do_push(repo: str, md: str, message: str = "", branch: str | None = None) -> dict:
-    files = extract_files(md)
-    res = await gh().commit_files(repo, files, message or "Update by ShadowV1", branch)
-    res["paths"] = [p for p, _ in files]
-    return res
-
-
-async def do_build(idea: str, private: bool = False, think: bool = False) -> dict:
-    res = await ask_deepseek(idea + BUILD_SUFFIX, None, think, False, True)
-    files = extract_files(res["reply"])
-    if not files:
-        return {"built": False, "reply": res["reply"]}
-    name = f"{slugify(idea)}-{secrets.token_hex(2)}"
-    repo = await gh().create_repo(name, private, f"{idea[:100]} (built by {BOT_NAME})")
-    commit = await gh().commit_files(repo["name"], files, f"Initial commit by {BOT_NAME}", repo["default_branch"])
-    out = {"built": True, "reply": res["reply"], "repo": repo["name"], "repo_url": repo["url"],
-           "files": [p for p, _ in files], "commit": commit["url"], "site": None, "note": ""}
-    paths = {p for p, _ in files}
-    runtime = ("docker" if "Dockerfile" in paths else "node" if "package.json" in paths
-               else "python" if "requirements.txt" in paths else "")
-    if os.getenv("RENDER_API_KEY") and runtime:
-        try:
-            svc = await rn().create_web_service(name, repo["url"], await render_owner(), runtime,
-                                                repo["default_branch"] or "main")
-            out["site"] = svc
-        except IntegrationError as e:
-            out["note"] = f"Pushed to GitHub, but hosting on Render failed: {e}"
-    elif not os.getenv("RENDER_API_KEY"):
-        out["note"] = "Add RENDER_API_KEY to host it automatically."
-    return out
-
-
-class PushIn(BaseModel):
-    repo: str
-    message: str = ""
-    markdown: str = ""
-    branch: str | None = None
-
-
-class NewRepoIn(BaseModel):
-    name: str
-    private: bool = True
-
-
-class RunIn(BaseModel):
-    repo: str
-    workflow: str
-    ref: str | None = None
-
-
-class DeployIn(BaseModel):
-    service: str = ""
-    clear_cache: bool = False
-
-
-class NewSiteIn(BaseModel):
-    name: str
-    repo_url: str
-    runtime: str = "docker"
-    branch: str = "main"
-
-
-class BuildIn(BaseModel):
-    idea: str
-    private: bool = False
-    think: bool = False
-
-
-@app.get("/github/repos")
-async def api_repos(authorization: str | None = Header(default=None)):
-    check_key(authorization)
-    return {"repos": await guard(gh().repos())}
-
-
-@app.post("/github/newrepo")
-async def api_newrepo(body: NewRepoIn, authorization: str | None = Header(default=None)):
-    check_key(authorization)
-    return await guard(gh().create_repo(body.name, body.private))
-
-
-@app.post("/github/push")
-async def api_push(body: PushIn, authorization: str | None = Header(default=None)):
-    check_key(authorization)
-    return await guard(do_push(body.repo, body.markdown, body.message, body.branch))
-
-
-@app.get("/github/runs")
-async def api_runs(repo: str, authorization: str | None = Header(default=None)):
-    check_key(authorization)
-    return {"runs": await guard(gh().runs(repo))}
-
-
-@app.post("/github/run")
-async def api_run(body: RunIn, authorization: str | None = Header(default=None)):
-    check_key(authorization)
-    return await guard(gh().dispatch(body.repo, body.workflow, body.ref))
-
-
-@app.get("/render/services")
-async def api_services(authorization: str | None = Header(default=None)):
-    check_key(authorization)
-    return {"services": await guard(rn().services())}
-
-
-@app.post("/render/deploy")
-async def api_deploy(body: DeployIn, authorization: str | None = Header(default=None)):
-    check_key(authorization)
-    svc = await guard(rn().find(body.service or os.getenv("RENDER_SERVICE_ID", "")))
-    return {"service": svc["name"], **await guard(rn().deploy(svc["id"], body.clear_cache))}
-
-
-@app.get("/render/deploys")
-async def api_deploys(service: str, authorization: str | None = Header(default=None)):
-    check_key(authorization)
-    svc = await guard(rn().find(service))
-    return {"service": svc["name"], "deploys": await guard(rn().deploys(svc["id"]))}
-
-
-@app.get("/render/logs")
-async def api_logs(service: str, authorization: str | None = Header(default=None)):
-    check_key(authorization)
-    svc = await guard(rn().find(service))
-    return {"service": svc["name"], "logs": await guard(rn().logs(svc["id"], svc["owner"]))}
-
-
-@app.post("/render/newsite")
-async def api_newsite(body: NewSiteIn, authorization: str | None = Header(default=None)):
-    check_key(authorization)
-    owner = await guard(render_owner())
-    return await guard(rn().create_web_service(body.name, body.repo_url, owner, body.runtime, body.branch))
-
-
-@app.post("/build")
-async def api_build(body: BuildIn, authorization: str | None = Header(default=None)):
-    check_key(authorization)
-    return await respond_json(guard(do_build(body.idea, body.private, body.think)), lambda r: r)
-
-
-# ---------------- saved settings (tokens live in the Key Value store, never in the page) ----------------
-CFG: dict = {"github_token": "", "render_key": "", "telegram_token": "", "tg_ids": [], "pair_code": "",
-             "github_login": "", "tg_username": ""}
-from collections import deque
-DIAG: deque = deque(maxlen=30)
-BOOT_AT = time.time()
-
-
-def diag_add(kind, secs, ok, note=""):
-    DIAG.append({"at": time.strftime("%H:%M:%S", time.gmtime()), "kind": kind, "secs": round(secs, 1), "ok": ok, "note": note[:120]})
-    log(f"[diag] {kind} {secs:.1f}s ok={ok} {note[:100]}")
-
-
-TG_OWNER = int(os.getenv("TELEGRAM_OWNER_ID", "8978770775"))   # always allowed
-TG_ALLOWED: set = set()
-PAIR_FAILS: dict = {}
-
-
-async def load_cfg():
-    try:
-        raw = await KV.get("shadowv1:cfg")
-        if raw:
-            CFG.update(json.loads(raw))
-    except Exception:
-        pass
-    CFG["telegram_token"] = CFG.get("telegram_token") or os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-    TG_ALLOWED.clear()
-    TG_ALLOWED.update(int(x) for x in CFG.get("tg_ids", []))
-    TG_ALLOWED.update(int(x) for x in re.findall(r"-?\d+", os.getenv("TELEGRAM_ALLOWED_IDS", "")))
-    TG_ALLOWED.add(TG_OWNER)
-
-
-async def save_cfg():
-    TG_ALLOWED.add(TG_OWNER)
-    CFG["tg_ids"] = sorted(TG_ALLOWED)
-    await KV.set("shadowv1:cfg", json.dumps(CFG))
-
-
-def gh() -> GitHub:
-    return GitHub(State.http, CFG.get("github_token") or None)
-
-
-def rn() -> RenderAPI:
-    return RenderAPI(State.http, CFG.get("render_key") or None)
-
-
-async def render_owner() -> str:
-    o = os.getenv("RENDER_OWNER_ID", "").strip()
-    if o:
-        return o
-    svcs = await rn().services(5)
-    if not svcs:
-        raise IntegrationError("No Render services found to read the workspace from. Set RENDER_OWNER_ID.")
-    return svcs[0]["owner"]
-
-
-# ---------------- AI agent mode (GitHub, Render, terminal). Only here, never in plain chat ----------------
-AGENT_SESS: dict = {}
-
-
-async def agent_ask(message, url, first, think=False):
-    return await ask_deepseek(message, url, think, False, True, AG.PROTOCOL if first else "", True)
-
-
-async def run_agent(key: str, message: str, think: bool = False, emit=None) -> dict:
-    sess = AGENT_SESS.setdefault(key, {"url": None, "pending": None, "lock": asyncio.Lock()})
-    steps: list = []
-
-    async def _emit(t):
-        steps.append(t)
-        if emit:
-            await emit(t)
-    async with sess["lock"]:
-        res = await AG.drive(sess, message, lambda m, u, f: agent_ask(m, u, f, think),
-                             AG.Toolbox(gh, rn), _emit)
-    res["steps"] = steps
-    res["reply"] = clean_reply(res.get("reply", ""))
-    return res
-
-
-class AgentIn(BaseModel):
-    message: str
-    session: str = "web"
-    think: bool = False
-
-
-@app.post("/agent")
-async def api_agent(body: AgentIn, authorization: str | None = Header(default=None)):
-    check_key(authorization)
-    return await respond_json(run_agent("web:" + body.session[:40], body.message, body.think), lambda r: r)
-
-
-@app.post("/agent/reset")
-async def api_agent_reset(session: str = "web", authorization: str | None = Header(default=None)):
-    check_key(authorization)
-    AGENT_SESS.pop("web:" + session[:40], None)
-    return {"ok": True}
-
-
-class CfgIn(BaseModel):
-    github_token: str | None = None
-    render_key: str | None = None
-    telegram_token: str | None = None
-
-
-def _cfg_view() -> dict:
-    return {"store": bool(KV.r),
-            "github": {"set": bool(CFG.get("github_token") or os.getenv("GITHUB_TOKEN")), "login": CFG.get("github_login", "")},
-            "render": {"set": bool(CFG.get("render_key") or os.getenv("RENDER_API_KEY"))},
-            "telegram": {"set": bool(CFG.get("telegram_token")), "username": CFG.get("tg_username", ""),
-                         "paired": len(TG_ALLOWED), "pair_code": CFG.get("pair_code", "")}}
-
-
-@app.get("/diag")
-async def get_diag(authorization: str | None = Header(default=None)):
-    check_key(authorization)
-    return {"browser_ok": _healthy(), "deepseek_connected": State.status.get("connected"), "busy": State.lock.locked(),
-            "uptime_min": int((time.time() - BOOT_AT) / 60), "recent": list(DIAG)}
-
-
-@app.get("/config")
-async def get_config(authorization: str | None = Header(default=None)):
-    check_key(authorization)
-    return _cfg_view()
-
-
-@app.post("/config")
-async def set_config(body: CfgIn, authorization: str | None = Header(default=None)):
-    check_key(authorization)
-    if body.github_token is not None:
-        tok = body.github_token.strip()
-        if tok:
-            CFG["github_login"] = await guard(GitHub(State.http, tok).me())
-        else:
-            CFG["github_login"] = ""
-        CFG["github_token"] = tok
-    if body.render_key is not None:
-        CFG["render_key"] = body.render_key.strip()
-        if CFG["render_key"]:
-            await guard(RenderAPI(State.http, CFG["render_key"]).services(1))
-    if body.telegram_token is not None:
-        tok = body.telegram_token.strip()
-        if tok:
-            r = await State.http.post(f"https://api.telegram.org/bot{tok}/getMe", timeout=20)
-            j = r.json()
-            if not j.get("ok"):
-                raise HTTPException(400, "Telegram rejected that token. Copy it again from @BotFather.")
-            if tok != CFG.get("telegram_token"):
-                TG_ALLOWED.clear()
-                TG_ALLOWED.add(TG_OWNER)
-            CFG["tg_username"] = (j.get("result") or {}).get("username", "")
-            CFG["pair_code"] = secrets.token_hex(4)
-        else:
-            CFG["tg_username"], CFG["pair_code"] = "", ""
-            TG_ALLOWED.clear()
-        CFG["telegram_token"] = tok
-        start_telegram()
-    await save_cfg()
-    return _cfg_view()
-
-
-@app.post("/config/unpair")
-async def unpair(authorization: str | None = Header(default=None)):
-    check_key(authorization)
-    TG_ALLOWED.clear()
-    TG_ALLOWED.add(TG_OWNER)
-    CFG["pair_code"] = secrets.token_hex(4) if CFG.get("telegram_token") else ""
-    await save_cfg()
-    return _cfg_view()
-
-
-# ---------------- Telegram bot ----------------
-TG_STATE: dict = {}
-
-
-async def load_tg_state():
-    try:
-        raw = await KV.get("shadowv1:tg")
-        if raw:
-            TG_STATE.update({int(k): v for k, v in json.loads(raw).items()})
-    except Exception:
-        pass
-
-
-async def tg_send(call, chat_id, md):
-    for chunk in split_md(md or "(empty reply)"):
-        r = await call("sendMessage", chat_id=chat_id, text=md_to_tg(chunk), parse_mode="HTML",
-                       disable_web_page_preview=False)
-        if not r.get("ok"):
-            for i in range(0, len(chunk), 4000):
-                await call("sendMessage", chat_id=chat_id, text=chunk[i:i + 4000])
-
-
-async def handle_tg(call, allowed, upd):
-    msg = upd.get("message") or {}
-    text = (msg.get("text") or "").strip()
-    chat_id = (msg.get("chat") or {}).get("id")
-    uid = (msg.get("from") or {}).get("id")
-    if not text or chat_id is None:
-        return
-    parts = text.split()
-    if uid not in allowed:
-        if parts[0].split("@")[0].lower() == "/pair" and len(parts) > 1 and CFG.get("pair_code"):
-            now = time.time()
-            fails = [t for t in PAIR_FAILS.get(uid, []) if now - t < 600]
-            if len(fails) >= 5:
-                await call("sendMessage", chat_id=chat_id, text="Too many tries. Wait 10 minutes.")
-            elif secrets.compare_digest(parts[1].strip().lower(), CFG["pair_code"]):
-                allowed.add(uid)
-                CFG["pair_code"] = secrets.token_hex(4)       # one-time code
-                await save_cfg()
-                await call("sendMessage", chat_id=chat_id,
-                           text=f"Paired. Welcome to {BOT_NAME} by {BOT_MAKER}. Send /help.")
-            else:
-                PAIR_FAILS[uid] = fails + [now]
-                await call("sendMessage", chat_id=chat_id, text="Wrong code.")
-        else:
-            await call("sendMessage", chat_id=chat_id,
-                       text="Private bot. Open your ShadowV1 website, go to the Agent page, and send me: /pair CODE")
-        return
-    st = TG_STATE.setdefault(chat_id, {"url": None, "think": False, "search": False, "mode": "auto"})
-    if not st.get("mode_set") and st.get("mode") not in ("chat", "agent", "auto"):
-        st["mode"] = "auto"
-    if not st.get("mode_set"):
-        st["mode"] = "auto"
-    cmd = parts[0].split("@")[0].lower() if text.startswith("/") else ""
-    arg = parts[1].lower() if len(parts) > 1 else ""
-    if cmd in ("/start", "/help"):
-        await call("sendMessage", chat_id=chat_id, text=(
-            f"{BOT_NAME} by {BOT_MAKER}.\n"
-            "Just talk. For real work (GitHub, builds, deploys, APKs, debugging) I switch to agent mode myself.\n"
-            "Deletes and merges always ask you to reply YES first.\n"
-            "/mode auto|agent|chat   /new   /think on|off   /search on|off\n"
-            "Say 'draw a ...' for an image or 'send 5 anime pics from pinterest' for photos."))
-        return
-    if cmd == "/diag":
-        rows = "\n".join(f"{d['at']} {d['kind']} {d['secs']}s {'ok' if d['ok'] else 'FAIL'} {d['note']}" for d in list(DIAG)[-8:])
-        await call("sendMessage", chat_id=chat_id, text=(
-            f"Browser: {'ok' if _healthy() else 'DOWN'} | DeepSeek login: {State.status.get('connected')} | "
-            f"busy: {State.lock.locked()} | up {int((time.time() - BOOT_AT) / 60)} min\n{rows or 'no requests yet'}"))
-        return
-    if cmd == "/mode":
-        if arg in ("auto", "chat", "agent"):
-            st["mode"], st["mode_set"] = arg, True
-        await call("sendMessage", chat_id=chat_id, text=f"Mode: {st['mode']}")
-        return
-    if cmd == "/new":
-        st["url"] = None
-        AGENT_SESS.pop(f"tg:{chat_id}", None)
-        await call("sendMessage", chat_id=chat_id, text="New chat started.")
-        return
-    if cmd in ("/think", "/search"):
-        k = cmd[1:]
-        st[k] = (arg == "on") if arg in ("on", "off") else (not st[k])
-        await call("sendMessage", chat_id=chat_id, text=f"{k.capitalize()}: {'ON' if st[k] else 'OFF'}")
-        return
-    if cmd:
-        text = text.lstrip("/")
-    await tg_work(call, chat_id, msg.get("message_id"), text, st)
-    await KV.set("shadowv1:tg", json.dumps(TG_STATE))
-
-
-AGENT_HINT = re.compile(
-    r"\b(github|git hub|repo|repository|commit|push|pull request|workflow|actions?|deploy|render|apk|build|"
-    r"terminal|shell|install|debug|branch|issue|release|npm|pip|docker|scaffold|clone|merge|delete (the )?(repo|file|branch)|"
-    r"(create|make|write|code)\s+(me\s+)?(a|an|the)?\s*(app|bot|website|site|api|project|script|game|tool))\b", re.I)
-SPIN = ["◐", "◓", "◑", "◒"]
-
-
-async def tg_react(call, chat_id, mid, emoji):
-    if mid:
-        await call("setMessageReaction", chat_id=chat_id, message_id=mid, reaction=[{"type": "emoji", "emoji": emoji}])
-
-
-async def tg_photos(call, chat_id, pics, caption=""):
-    """Send real photos as one album. Telegram can't fetch Pinterest links itself, so download in parallel and upload."""
-    async def grab(x):
-        try:
-            return await asyncio.wait_for(fetch_bytes(State.http, x["url"]), 25)
-        except Exception:
-            return None
-    got = [(x, d) for x, d in zip(pics[:10], await asyncio.gather(*[grab(x) for x in pics[:10]])) if d]
-    if len(got) > 1:
-        files, media = {}, []
-        for i, (x, (data, ctype)) in enumerate(got):
-            files[f"p{i}"] = (f"pic{i}.jpg", data, ctype)
-            media.append({"type": "photo", "media": f"attach://p{i}", **({"caption": caption[:200]} if i == 0 else {})})
-        r = await call("sendMediaGroup", chat_id=chat_id, media=media, files=files)
-        if r.get("ok"):
-            return len(got)
-    sent = 0
-    for x, (data, ctype) in got:
-        r = await call("sendPhoto", chat_id=chat_id, caption=(caption if not sent else "")[:200],
-                       files={"photo": ("pic.jpg", data, ctype)})
-        sent += 1 if r.get("ok") else 0
-    if not sent:                       # last resort: let Telegram try the links itself
-        urls = [x["url"] for x in pics][:10]
-        if len(urls) > 1:
-            r = await call("sendMediaGroup", chat_id=chat_id,
-                           media=[{"type": "photo", "media": u} for u in urls])
-        else:
-            r = await call("sendPhoto", chat_id=chat_id, photo=urls[0]) if urls else {}
-        sent = len(urls) if r.get("ok") else 0
-    return sent
-
-
-async def tg_work(call, chat_id, mid, text, st):
-    kind, p = detect_intent(text)
-    sess = AGENT_SESS.get(f"tg:{chat_id}")
-    pending = bool(sess and sess.get("pending"))
-    use_agent = pending or (kind == "chat" and (st["mode"] == "agent" or
-                                                (st["mode"] == "auto" and bool(AGENT_HINT.search(text)))))
-    if st["mode"] == "chat" and not pending:
-        use_agent = False
-    await tg_react(call, chat_id, mid, "👀")
-    if State.lock.locked():
-        await call("sendMessage", chat_id=chat_id, text="⏳ Another request is running (website or another chat). "
-                                                         "Yours is next.")
-    action = "upload_photo" if kind in ("image", "pins") else "typing"
-    typing = asyncio.create_task(_typing(call, chat_id, action))
-    status = {"id": None, "text": "Thinking"}
-    anim = None
-    if use_agent or kind != "chat" or st["think"]:
-        r = await call("sendMessage", chat_id=chat_id, text=f"{SPIN[0]} {status['text']}")
-        status["id"] = (r.get("result") or {}).get("message_id")
-
-        async def animate():
-            i = 0
-            while True:
-                await asyncio.sleep(3)
-                i += 1
-                await call("editMessageText", chat_id=chat_id, message_id=status["id"],
-                           text=f"{SPIN[i % 4]} {status['text']}{'.' * (i % 4)}")
-        if status["id"]:
-            anim = asyncio.create_task(animate())
-    await tg_react(call, chat_id, mid, "👨‍💻" if use_agent else "🤩" if kind == "image" else "🤔")
-    ok, note, t0 = True, "", time.time()
-    try:
-        async def work():
-            if use_agent:
-                async def emit(t):
-                    status["text"] = "🔧 " + t[:120]
-                res = await run_agent(f"tg:{chat_id}", text, st["think"], emit)
-                await tg_send(call, chat_id, res["reply"])
-            elif kind == "image":
-                status["text"] = "Painting your image"
-                img, ctype, _ = await guard(make_image(p["prompt"]))
-                r = await call("sendPhoto", chat_id=chat_id, caption=p["prompt"][:200],
-                               files={"photo": ("image.jpg", img, ctype)})
-                if not r.get("ok"):
-                    await tg_send(call, chat_id, "Could not send the image. Try again.")
-            elif kind == "pins":
-                status["text"] = f"Finding {p['amount']} pictures"
-                pics = await guard(search_pictures(State.http, p["query"], p["amount"]))
-                n = await tg_photos(call, chat_id, pics, p["query"])
-                if not n:
-                    await tg_send(call, chat_id, "\n".join(x["url"] for x in pics) or "No pictures found.")
-            else:
-                res = await smart_chat(text, st["url"], st["think"], st["search"], True, "chat")
-                st["url"] = res["chat_url"]
-                await tg_send(call, chat_id, res["reply"])
-        await asyncio.wait_for(work(), 600 if use_agent else 240)
-    except asyncio.TimeoutError:
-        ok = False
-        await call("sendMessage", chat_id=chat_id, text="That took too long. Try again, or send /new.")
-    except HTTPException as e:
-        ok, note = False, f"{e.status_code} {e.detail}"
-        await call("sendMessage", chat_id=chat_id, text=f"Error: {e.detail}")
-    except Exception as e:
-        ok, note = False, f"{type(e).__name__} {e}"
-        log("[telegram] work error:", type(e).__name__, str(e)[:200])
-        await call("sendMessage", chat_id=chat_id, text=f"Error: {e}")
-    finally:
-        typing.cancel()
-        if anim:
-            anim.cancel()
-        if status["id"]:
-            await call("deleteMessage", chat_id=chat_id, message_id=status["id"])
-    diag_add("tg-" + ("agent" if use_agent else kind), time.time() - t0, ok, note or text[:40])
-    await tg_react(call, chat_id, mid, "🔥" if ok else "😢")
-
-
-async def _typing(call, chat_id, action="typing"):
-    while True:
-        await call("sendChatAction", chat_id=chat_id, action=action)
-        await asyncio.sleep(4)
-
-
-def start_telegram():
-    t = getattr(State, "tg_task", None)
-    if t:
-        t.cancel()
-    State.tg_task = asyncio.create_task(telegram_loop())
-
-
-async def telegram_loop():
-    token = (CFG.get("telegram_token") or "").strip()
-    if not token:
-        log("[telegram] off (no token yet; add it on the Agent page)")
-        return
-
-    async def call(method, **kw):
-        try:
-            files = kw.pop("files", None)
-            url = f"https://api.telegram.org/bot{token}/{method}"
-            if files:
-                r = await State.http.post(url, data={k: (json.dumps(v) if isinstance(v, (list, dict)) else str(v))
-                                                     for k, v in kw.items()}, files=files, timeout=90)
-            else:
-                r = await State.http.post(url, json=kw, timeout=50)
-            j = r.json()
-            if not j.get("ok"):
-                log(f"[telegram] {method}: {j.get('description')}")
-            return j
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            log(f"[telegram] {method} error: {type(e).__name__}")
-            return {}
-
-    await call("deleteWebhook")
-    me = await call("getMe")
-    log("[telegram] bot ready:", (me.get("result") or {}).get("username"), "paired ids:", len(TG_ALLOWED))
-    offset = 0
-    while True:
-        data = await call("getUpdates", offset=offset, timeout=30, allowed_updates=["message"])
-        if not data.get("ok"):
-            await asyncio.sleep(5)
-            continue
-        for u in data.get("result", []):
-            offset = u["update_id"] + 1
-            asyncio.create_task(handle_tg(call, TG_ALLOWED, u))
 
 
 # ---------------- connect via your own Chrome ----------------
@@ -1711,12 +1011,7 @@ async def connect_page():
 
 @app.get("/guide")
 async def guide_page():
-    return FileResponse(HERE / "guide.html")
-
-
-@app.get("/agent")
-async def agent_page():
-    return FileResponse(HERE / "agent.html")
+    return FileResponse(HERE / "index.html")
 
 
 @app.get("/import")
@@ -1729,39 +1024,3 @@ async def health():
     return {"ok": True}
 
 
-# ---------------- prompt URL:  https://HOST/<your prompt>?key=KEY  ----------------
-_RESERVED = ("favicon.ico", "robots.txt", "apple-touch-icon.png", "sitemap.xml")
-
-
-@app.get("/{prompt:path}")
-async def prompt_api(prompt: str, key: str | None = None, think: bool = False, search: bool = False,
-                     format: str = "text", chat: str | None = None,
-                     authorization: str | None = Header(default=None),
-                     x_api_key: str | None = Header(default=None)):
-    if not prompt.strip() or prompt in _RESERVED or prompt.split("/")[0] in (
-            "v1", "github", "render", "remote", "media", "docs", "openapi.json"):
-        raise HTTPException(404, "Not found")
-    try:
-        check_key(authorization, key, x_api_key)
-    except HTTPException:
-        raise HTTPException(401, "Add your key: /your prompt?key=YOUR_KEY")
-    kind, p = detect_intent(prompt)
-    if kind == "image":
-        data, ctype, _ = await guard(make_image(p["prompt"]))
-        return Response(data, media_type=ctype)
-    if kind == "pins":
-        pics = await guard(search_pictures(State.http, p["query"], p["amount"]))
-        if format == "json":
-            return {"query": p["query"], "results": pics}
-        return Response("\n".join(x["url"] for x in pics), media_type="text/plain; charset=utf-8")
-    res = await ask_deepseek(prompt, chat, think, search, True, "", False, None, chat is None)
-    if format == "json":
-        return {**{k: res[k] for k in ("thinking", "chat_url", "features")}, "reply": clean_reply(res["reply"])}
-    return Response(clean_reply(res["reply"]), media_type="text/plain; charset=utf-8",
-                    headers={"X-Chat-Url": res["chat_url"]})
-
-
-if __name__ == "__main__":
-    port = int(os.getenv("PORT", "8000"))
-    host = "0.0.0.0" if os.getenv("PORT") else "127.0.0.1"
-    uvicorn.run(app, host=host, port=port)
