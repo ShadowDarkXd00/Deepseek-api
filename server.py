@@ -35,6 +35,7 @@ from shadow import (BOT_NAME, BOT_MAKER, JS_GRAB, JS_TOGGLE, REMINDER, SEARCH_LA
                     has_cjk_prose, html_to_md, is_agent_request, md_to_tg, slugify, split_md, with_system)
 from media import MediaError, fetch_bytes, generate_image, img_path, search_pictures, sign
 import agent as AG
+import anthropic_api as AN
 from integrations import GitHub, IntegrationError, RenderAPI
 
 # ---------- CONFIG ----------
@@ -798,6 +799,80 @@ async def oai(body: OAIIn, authorization: str | None = Header(default=None)):
             media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
     return await respond_json(ask_deepseek(prompt, None, think, search, True, extra, agent, None, True),
                               lambda r: _oai_payload(body.model, r, len(prompt)))
+
+
+# ---------------- Anthropic Messages API (Claude Code, AntiGem's Claude path) ----------------
+class AnthIn(BaseModel):
+    model: str = "shadowv1"
+    messages: list
+    system: str | list | None = None
+    tools: list | None = None
+    stream: bool = False
+    max_tokens: int | None = None
+    model_config = {"extra": "allow"}
+
+
+def _anth_err(status: int, kind: str, msg: str):
+    return JSONResponse({"type": "error", "error": {"type": kind, "message": str(msg)}}, status_code=status)
+
+
+async def anth_run(body: AnthIn, instr: str, convo: str, names: list, in_tokens: int) -> dict:
+    think = "think" in (body.model or "").lower()
+    res = await ask_deepseek(convo, None, think, False, True, instr, True, None, True)
+    blocks, stop = AN.parse_reply(res["reply"], names)
+    return AN.message_obj(body.model, blocks, stop, in_tokens)
+
+
+@app.post("/v1/messages")
+@app.post("/messages")
+async def anth_messages(body: AnthIn, authorization: str | None = Header(default=None),
+                        x_api_key: str | None = Header(default=None)):
+    try:
+        check_key(authorization, None, x_api_key)
+    except HTTPException as e:
+        return _anth_err(401, "authentication_error", e.detail)
+    d = body.model_dump()
+    instr, convo = AN.build_prompt(d)
+    names = [t.get("name") for t in (d.get("tools") or []) if isinstance(t, dict) and t.get("name")]
+    in_tokens = (len(instr) + len(convo)) // 4
+    if not body.stream:
+        try:
+            return await respond_json(anth_run(body, instr, convo, names, in_tokens), lambda r: r)
+        except HTTPException as e:
+            return _anth_err(e.status_code, "api_error", e.detail)
+
+    async def gen():
+        yield AN.start_events(AN.message_obj(body.model, [], "end_turn", in_tokens))
+        task = asyncio.create_task(anth_run(body, instr, convo, names, in_tokens))
+        while True:
+            done, _ = await asyncio.wait({task}, timeout=8)
+            if done:
+                break
+            yield AN.ping()
+        try:
+            msg = task.result()
+        except HTTPException as e:
+            yield AN.error_event(str(e.detail))
+            return
+        except Exception as e:
+            yield AN.error_event(f"{type(e).__name__}: {e}")
+            return
+        for ev in AN.body_events(msg):
+            yield ev
+    return StreamingResponse(gen(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
+@app.post("/v1/messages/count_tokens")
+@app.post("/messages/count_tokens")
+async def anth_count(body: AnthIn, authorization: str | None = Header(default=None),
+                     x_api_key: str | None = Header(default=None)):
+    try:
+        check_key(authorization, None, x_api_key)
+    except HTTPException as e:
+        return _anth_err(401, "authentication_error", e.detail)
+    instr, convo = AN.build_prompt(body.model_dump())
+    return {"input_tokens": (len(instr) + len(convo)) // 4}
 
 
 class ImgIn(BaseModel):

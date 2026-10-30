@@ -74,6 +74,13 @@
   <li>Agents send very long prompts, so replies can take a while. Prefer <code>shadowv1</code> over the think model.</li>
 </ol></div>
 
+<h3>Claude Code / AntiGem (Anthropic format)</h3>
+<div class="card"><ol>
+  <li>In Termux (AntiGem's terminal) run: <code>mkdir -p ~/.claude</code> then edit <code>~/.claude/settings.json</code> to:</li>
+</ol>
+<pre><code id="c8"></code></pre>
+<p class="mut">Then open AntiGem, go to Settings &gt; Claude Code and start a chat. Tools are emulated on top of DeepSeek's web chat, so it is slower and sometimes needs a retry. Use <code>shadowv1-think</code> as the model for hard tasks.</p></div>
+
 <h3>Build and ship (needs tokens)</h3>
 <p class="mut">Add <code>GITHUB_TOKEN</code> and <code>RENDER_API_KEY</code> in Render's Environment tab. Then:<br>
 <code>POST /build</code> {"idea": "a todo app"}: builds it, pushes to a new GitHub repo, and hosts it on Render.<br>
@@ -131,6 +138,17 @@ $('#c7').textContent =
 
 ${BASE}/img/samurai cat on a rooftop?key=${K}   (opens the image directly)
 ${BASE}/pins/anime aesthetic?n=5&key=${K}      (picture links)`;
+$('#c8').textContent =
+`{
+  "env": {
+    "ANTHROPIC_BASE_URL": "${BASE}",
+    "ANTHROPIC_AUTH_TOKEN": "${K}",
+    "ANTHROPIC_MODEL": "shadowv1",
+    "ANTHROPIC_SMALL_FAST_MODEL": "shadowv1",
+    "DISABLE_NON_ESSENTIAL_MODEL_CALLS": "1",
+    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1"
+  }
+}`;
 document.querySelectorAll('pre').forEach(pre => {
   const b = document.createElement('button'); b.className = 'cp'; b.textContent = 'Copy';
   b.onclick = async () => {
